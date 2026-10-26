@@ -1,0 +1,38 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "services": {
+    "circular-ewaste-recovery": {
+      "root": ".",
+      "framework": "flask",
+      "entrypoint": "wsgi.py",
+      "buildCommand": "pip install -r backend/requirements.txt",
+      "bindings": [
+        {
+          "type": "service",
+          "service": "backend",
+          "format": "url",
+          "env": "BACKEND_URL"
+        }
+      ]
+    },
+    "backend": {
+      "root": "backend",
+      "framework": "flask",
+      "entrypoint": "wsgi.py"
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/api/(.*)",
+      "destination": {
+        "service": "backend"
+      }
+    },
+    {
+      "source": "/(.*)",
+      "destination": {
+        "service": "circular-ewaste-recovery"
+      }
+    }
+  ]
+}

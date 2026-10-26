@@ -290,6 +290,7 @@ def create_app(database=None, config_class=None):
             demo_time=demo_time,
             demo_month=now.strftime("%B %Y"),
             current_year=now.year,
+            backend_url=app.config.get("BACKEND_URL", ""),
         )
 
     @app.before_request

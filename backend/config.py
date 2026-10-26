@@ -84,8 +84,16 @@ class Config:
 
     SQLALCHEMY_TRACK_MODIFICATIONS = False
 
+    # Vercel internal service bindings (multi-service routing & communication)
+    BACKEND_URL = os.environ.get("BACKEND_URL", "").rstrip("/")
+
     # Outbound Partner API settings (Refurbishment Intelligence Service)
-    PARTNER_API_URL = os.environ.get("PARTNER_API_URL", "").rstrip("/")
+    # Supports direct environment setting or Vercel service binding
+    PARTNER_API_URL = (
+        os.environ.get("PARTNER_API_URL")
+        or os.environ.get("REFURBISHMENT_SERVICE_URL")
+        or ""
+    ).rstrip("/")
     PARTNER_API_KEY = os.environ.get("PARTNER_API_KEY", "")
 
     # Inbound API authentication key (used by partners calling our endpoints)
@@ -147,6 +155,7 @@ class TestConfig(Config):
     IS_PRODUCTION = False
     SECRET_KEY = "test-only-secret-key"
     SQLALCHEMY_DATABASE_URI = "sqlite:///:memory:"
+    BACKEND_URL = "http://internal-backend"
     PARTNER_API_URL = "https://partner.example.com"
     PARTNER_API_KEY = "test-partner-key"
     CIRCULAR_API_KEY = "test-circular-key"
