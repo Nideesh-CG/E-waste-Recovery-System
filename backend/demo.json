@@ -1,0 +1,94 @@
+{
+  "devices": [
+    {
+      "id": "EW-2024-00128",
+      "name": "Dell Latitude 5420",
+      "type": "Laptop",
+      "brand": "Dell",
+      "model": "Latitude 5420",
+      "status": "Pending assessment",
+      "date": "Oct 09, 2026",
+      "condition": "Minor damage",
+      "year": "2021",
+      "weight": "1.4"
+    },
+    {
+      "id": "EW-2024-00127",
+      "name": "Samsung Galaxy S21",
+      "type": "Smartphone",
+      "brand": "Samsung",
+      "model": "Galaxy S21",
+      "status": "Refurbishment",
+      "date": "Oct 09, 2026",
+      "condition": "Screen damaged",
+      "year": "2021",
+      "weight": "0.17"
+    },
+    {
+      "id": "EW-2024-00126",
+      "name": "HP EliteDisplay E243",
+      "type": "Monitor",
+      "brand": "HP",
+      "model": "EliteDisplay E243",
+      "status": "Parts recovery",
+      "date": "Oct 08, 2026",
+      "condition": "Not working",
+      "year": "2019",
+      "weight": "5.6"
+    },
+    {
+      "id": "EW-2024-00125",
+      "name": "Apple MacBook Air",
+      "type": "Laptop",
+      "brand": "Apple",
+      "model": "MacBook Air",
+      "status": "Completed",
+      "date": "Oct 08, 2026",
+      "condition": "Good",
+      "year": "2020",
+      "weight": "1.3"
+    }
+  ],
+  "transfers": [
+    {
+      "id": "TRF-00842",
+      "file": "device_EW00127.json",
+      "sender": "Collection",
+      "receiver": "Refurbishment",
+      "status": "Completed",
+      "time": "Today, 01:22 PM"
+    },
+    {
+      "id": "TRF-00841",
+      "file": "assessment_EW00126.json",
+      "sender": "Refurbishment",
+      "receiver": "Collection",
+      "status": "Completed",
+      "time": "Today, 01:18 PM"
+    },
+    {
+      "id": "TRF-00840",
+      "file": "device_EW00128.json",
+      "sender": "Collection",
+      "receiver": "Refurbishment",
+      "status": "Processing",
+      "time": "Today, 01:15 PM"
+    },
+    {
+      "id": "TRF-00839",
+      "file": "device_EW00124.json",
+      "sender": "Collection",
+      "receiver": "Refurbishment",
+      "status": "Pending",
+      "time": "Today, 12:34 PM"
+    },
+    {
+      "id": "TRF-00838",
+      "file": "assessment_EW00123.json",
+      "sender": "Refurbishment",
+      "receiver": "Collection",
+      "status": "Failed",
+      "time": "Yesterday, 01:27 PM"
+    }
+  ]
+}

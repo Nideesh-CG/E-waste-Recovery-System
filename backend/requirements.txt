@@ -1,0 +1,11 @@
+Flask>=3.1,<4
+beautifulsoup4>=4.13,<5
+Flask-SQLAlchemy>=3.1,<4
+SQLAlchemy>=2.0,<3
+requests>=2.31,<3
+reportlab>=4.0,<6
+pytest>=8.0,<10
+gunicorn>=21.0,<27
+python-dotenv>=1.0,<2
+Flask-Migrate>=4.0,<5
+psycopg[binary]>=3.1,<4

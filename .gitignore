@@ -1,0 +1,47 @@
+# Virtual environments
+.venv/
+*/.venv/
+venv/
+*/venv/
+env/
+*/env/
+
+# Python bytecode & caches
+__pycache__/
+*/__pycache__/
+*/*/__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+*/.pytest_cache/
+
+# Local databases and uploaded private files
+instance/
+*/instance/
+*.sqlite
+*.sqlite3
+*.db
+uploads/
+*/uploads/
+
+# Environment files and credentials
+.env
+*/.env
+*.env.local
+
+# Editor and IDE configurations
+.vscode/
+*/.vscode/
+.idea/
+*/.idea/
+*.swp
+*.swo
+
+# Test coverage artifacts
+.coverage
+htmlcov/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+Desktop.ini

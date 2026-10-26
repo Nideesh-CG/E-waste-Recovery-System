@@ -1,0 +1,33 @@
+# Environments and dependencies
+.venv/
+env/
+venv/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local configurations and secret keys
+.env
+.env.local
+
+# Database files and persistent instance directory
+instance/
+*.sqlite
+*.sqlite3
+*.db
+uploads/
+
+# Test and coverage caches
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editor and OS caches
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+Desktop.ini
