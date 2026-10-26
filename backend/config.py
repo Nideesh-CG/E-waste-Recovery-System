@@ -55,16 +55,17 @@ class Config:
 
     MAX_CONTENT_LENGTH = int(os.environ.get("MAX_CONTENT_LENGTH", 16 * 1024 * 1024))
 
-    # File storage directory: supports Render persistent disk mounted at /var/data/uploads
+    # File storage directory: supports Render persistent disk mounted at /var/data/uploads,
+    # Vercel /tmp/uploads, or local instance/uploads
     UPLOAD_STORAGE_PATH = (
         os.environ.get("UPLOAD_STORAGE_PATH")
         or os.environ.get("UPLOAD_FOLDER")
-        or str(BASE_DIR / "instance" / "uploads")
+        or (str(Path("/tmp/uploads")) if os.environ.get("VERCEL") else str(BASE_DIR / "instance" / "uploads"))
     )
     UPLOAD_FOLDER = UPLOAD_STORAGE_PATH
     STORAGE_PROVIDER = "local"
 
-    # Database configuration supporting SQLite local and PostgreSQL on Render
+    # Database configuration supporting SQLite local and PostgreSQL on Render / Vercel
     _raw_db_url = os.environ.get("DATABASE_URL")
     if _raw_db_url:
         SQLALCHEMY_DATABASE_URI = normalize_database_url(_raw_db_url)
@@ -75,11 +76,20 @@ class Config:
                 if not db_p.is_absolute():
                     db_p = (BASE_DIR / db_p).resolve()
                     SQLALCHEMY_DATABASE_URI = f"sqlite:///{db_p}"
-                db_p.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    db_p.parent.mkdir(parents=True, exist_ok=True)
+                except OSError:
+                    pass
     else:
-        # Default local SQLite database
-        instance_dir = BASE_DIR / "instance"
-        instance_dir.mkdir(parents=True, exist_ok=True)
+        # Default local SQLite database (uses /tmp on Vercel serverless environment)
+        if os.environ.get("VERCEL"):
+            instance_dir = Path("/tmp")
+        else:
+            instance_dir = BASE_DIR / "instance"
+            try:
+                instance_dir.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                instance_dir = Path("/tmp")
         SQLALCHEMY_DATABASE_URI = f"sqlite:///{instance_dir / 'circular.sqlite3'}"
 
     SQLALCHEMY_TRACK_MODIFICATIONS = False

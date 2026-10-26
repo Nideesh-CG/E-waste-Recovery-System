@@ -145,7 +145,10 @@ def create_app(database=None, config_class=None):
         or str(ROOT / "instance/uploads")
     )
     upload_dir = Path(upload_path).resolve()
-    upload_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        upload_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
 
     db.init_app(app)
     migrate.init_app(app, db)

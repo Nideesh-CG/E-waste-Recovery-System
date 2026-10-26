@@ -5,7 +5,6 @@
       "root": ".",
       "framework": "flask",
       "entrypoint": "wsgi.py",
-      "buildCommand": "pip install -r backend/requirements.txt",
       "bindings": [
         {
           "type": "service",
