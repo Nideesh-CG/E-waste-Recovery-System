@@ -192,15 +192,23 @@ def create_app(database=None, config_class=None):
     if is_production:
         Config.validate_production_config(app.config)
 
-    if not is_cli_db_command and not is_production:
-        with app.app_context():
-            db.create_all()
-
     if not is_cli_db_command:
         with app.app_context():
+            try:
+                inspector = inspect(db.engine)
+                if not inspector.has_table("devices"):
+                    db.create_all()
+                    inspector = inspect(db.engine)
+            except Exception as exc:
+                app.logger.warning("Database schema initialization warning: %s", exc)
+                try:
+                    db.create_all()
+                    inspector = inspect(db.engine)
+                except Exception:
+                    pass
+
             # Only seed initial demo data if tables exist (e.g. after migration or in testing)
-            inspector = inspect(db.engine)
-            if inspector.has_table("devices") and inspector.has_table("metadata"):
+            if inspector and inspector.has_table("devices") and inspector.has_table("metadata"):
                 should_seed = False if is_production else app.config.get("SEED_DEMO_DATA", True)
                 if should_seed and not Metadata.query.filter_by(key="seeded").first():
                     for record in DEMO["devices"]:
