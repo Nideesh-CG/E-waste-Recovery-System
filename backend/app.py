@@ -162,7 +162,10 @@ def create_app(database=None, config_class=None):
     migrate.init_app(app, db)
     app.register_blueprint(api_bp)
 
-    is_cli_db_command = any("db" in str(arg) for arg in sys.argv)
+    is_cli_db_command = (
+        any(str(arg).strip().lower() == "db" for arg in sys.argv)
+        and any("flask" in str(arg).lower() for arg in sys.argv)
+    )
     is_production = (
         app.config.get("IS_PRODUCTION", False)
         or os.environ.get("IS_PRODUCTION", "").lower() in ("true", "1", "yes")
