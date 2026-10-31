@@ -155,7 +155,30 @@ def create_app(database=None, config_class=None):
     app.register_blueprint(api_bp)
 
     is_cli_db_command = any("db" in str(arg) for arg in sys.argv)
-    is_production = app.config.get("IS_PRODUCTION", False)
+    is_production = (
+        app.config.get("IS_PRODUCTION", False)
+        or os.environ.get("IS_PRODUCTION", "").lower() in ("true", "1", "yes")
+        or os.environ.get("ENV") == "production"
+        or os.environ.get("FLASK_ENV") == "production"
+        or os.environ.get("VERCEL_ENV") == "production"
+        or bool(os.environ.get("VERCEL"))
+        or bool(os.environ.get("RENDER"))
+    )
+    app.config["IS_PRODUCTION"] = is_production
+
+    from werkzeug.middleware.proxy_fix import ProxyFix
+
+    # Apply ProxyFix for Vercel and production deployments (HTTPS, client IP, reverse proxy)
+    if is_production or os.environ.get("VERCEL"):
+        app.wsgi_app = ProxyFix(
+            app.wsgi_app,
+            x_for=1,
+            x_proto=1,
+            x_host=0,  # Do not trust arbitrary forwarded host headers (security requirement)
+            x_port=1,
+            x_prefix=1,
+        )
+
     if is_production:
         Config.validate_production_config(app.config)
 
@@ -272,7 +295,10 @@ def create_app(database=None, config_class=None):
         return Device.query.filter_by(id=device_id).first()
 
     def csrf():
-        return session.setdefault("csrf", secrets.token_hex(24))
+        if "csrf" not in session:
+            session["csrf"] = secrets.token_hex(24)
+            session.permanent = True
+        return session["csrf"]
 
     @app.context_processor
     def demonstration_dates():
@@ -311,12 +337,92 @@ def create_app(database=None, config_class=None):
 
     @app.before_request
     def protect_forms():
+        # Exempt machine-to-machine API routes which use API keys
         if request.path.startswith("/api/"):
             return None
-        if request.method == "POST" and not secrets.compare_digest(
-            request.form.get("csrf", ""), csrf()
-        ):
-            abort(400, "Invalid form token. Reload the page and try again.")
+
+        # Only validate state-changing HTTP methods
+        if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+            # Check submitted CSRF token from form body, headers, or JSON body
+            submitted_token = (
+                request.form.get("csrf")
+                or request.headers.get("X-CSRF-Token")
+                or request.headers.get("X-CSRFToken")
+            )
+            if not submitted_token and request.is_json:
+                json_data = request.get_json(silent=True) or {}
+                submitted_token = json_data.get("csrf")
+
+            session_token = session.get("csrf")
+            session_cookie_name = app.config.get("SESSION_COOKIE_NAME", "circular_session")
+            has_session_cookie = (
+                session_cookie_name in request.cookies or "session" in request.cookies
+            )
+
+            failure_category = None
+            if not session_token:
+                failure_category = "session_missing"
+            elif not submitted_token:
+                failure_category = "token_missing"
+            elif not secrets.compare_digest(str(submitted_token).strip(), str(session_token).strip()):
+                failure_category = "token_mismatch"
+
+            if failure_category:
+                # Log failure safely without logging actual CSRF tokens, session cookies, passwords, or secret keys
+                app.logger.warning(
+                    "CSRF validation failure: path=%s method=%s token_present=%s session_cookie_present=%s category=%s",
+                    request.path,
+                    request.method,
+                    bool(submitted_token),
+                    has_session_cookie,
+                    failure_category,
+                )
+
+                if (
+                    request.is_json
+                    or request.headers.get("X-Requested-With") == "XMLHttpRequest"
+                    or "application/json" in request.headers.get("Accept", "")
+                ):
+                    return jsonify({
+                        "error": "Bad Request",
+                        "message": "Invalid or expired form security token. Reload the page and try again.",
+                        "category": failure_category,
+                    }), 400
+
+                error_html = (
+                    "<!doctype html>"
+                    "<html lang=\"en\">"
+                    "<head>"
+                    "<meta charset=\"utf-8\">"
+                    "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+                    "<title>Security Token Expired · Circular</title>"
+                    "<link rel=\"stylesheet\" href=\"/static/style.css\">"
+                    "</head>"
+                    "<body class=\"flex min-h-screen items-center justify-center bg-[#f7faf7] p-4 text-[#20372c]\">"
+                    "<div class=\"w-full max-w-md rounded-2xl border border-[#e1e8e1] bg-white p-8 text-center shadow-sm\">"
+                    "<div class=\"mx-auto mb-4 flex size-12 items-center justify-center rounded-full bg-[#fde8e8] text-[#c81e1e]\">"
+                    "<svg width=\"24\" height=\"24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" viewBox=\"0 0 24 24\">"
+                    "<path d=\"m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z\"/>"
+                    "<path d=\"M12 9v4\"/><path d=\"M12 17h.01\"/>"
+                    "</svg>"
+                    "</div>"
+                    "<h1 class=\"text-base font-semibold text-[#1c3327]\">Security Token Expired</h1>"
+                    "<p class=\"mt-2 text-xs leading-relaxed text-[#78857b]\">"
+                    "Your form session security token is invalid or has expired. Reload the page and try again."
+                    "</p>"
+                    "<div class=\"mt-6 flex flex-col gap-2.5\">"
+                    "<a href=\"javascript:location.reload()\" class=\"inline-flex items-center justify-center rounded-lg bg-[#176044] px-4 py-2.5 text-xs font-semibold text-white transition hover:bg-[#104c35]\">"
+                    "Reload Page &amp; Try Again"
+                    "</a>"
+                    f"<a href=\"{request.path}\" class=\"inline-flex items-center justify-center rounded-lg border border-[#d2ddd2] bg-white px-4 py-2 text-xs font-medium text-[#4b6152] transition hover:bg-[#f3f7f3]\">"
+                    "Return to Form"
+                    "</a>"
+                    "</div>"
+                    "</div>"
+                    "</body>"
+                    "</html>"
+                )
+                return error_html, 400
 
     @app.errorhandler(413)
     @app.errorhandler(RequestEntityTooLarge)
@@ -975,10 +1081,14 @@ def create_app(database=None, config_class=None):
                     reports_list.append(empty_msg)
 
         for f in document.select("form[method=post]"):
-            field = document.new_tag(
-                "input", attrs={"type": "hidden", "name": "csrf", "value": csrf()}
-            )
-            f.insert(0, field)
+            existing_csrf = f.select_one("input[name=csrf]")
+            if existing_csrf:
+                existing_csrf["value"] = csrf()
+            else:
+                field = document.new_tag(
+                    "input", attrs={"type": "hidden", "name": "csrf", "value": csrf()}
+                )
+                f.insert(0, field)
 
         return render_template(
             "base.html", content=Markup(str(document)), csrf=csrf()

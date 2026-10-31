@@ -5,6 +5,7 @@ Pure local and persistent disk storage (no S3 or Supabase).
 
 import os
 import secrets
+from datetime import timedelta
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -39,19 +40,31 @@ def normalize_database_url(url: str) -> str:
 class Config:
     """Base application configuration."""
     ENV = os.environ.get("FLASK_ENV", os.environ.get("ENV", "development"))
+    IS_VERCEL = bool(os.environ.get("VERCEL"))
+    VERCEL_ENV = os.environ.get("VERCEL_ENV", "")
     IS_PRODUCTION = (
         os.environ.get("IS_PRODUCTION", "").lower() in ("true", "1", "yes")
         or ENV == "production"
+        or VERCEL_ENV == "production"
+        or (IS_VERCEL and VERCEL_ENV not in ("development", "local"))
         or bool(os.environ.get("RENDER"))
     )
 
     # Secret key for sessions and CSRF
     _secret = os.environ.get("CIRCULAR_SECRET_KEY") or os.environ.get("SECRET_KEY")
-    if not _secret and IS_PRODUCTION:
+    if not _secret and (IS_PRODUCTION or IS_VERCEL):
         raise RuntimeError(
-            "Security Error: CIRCULAR_SECRET_KEY or SECRET_KEY must be explicitly configured in production."
+            "Security Error: CIRCULAR_SECRET_KEY or SECRET_KEY must be explicitly configured in Vercel environment variables. "
+            "Serverless execution requires a consistent, stable secret key across all instances to prevent CSRF token mismatches."
         )
     SECRET_KEY = _secret or secrets.token_hex(32)
+
+    # Session cookie security configuration for production and Vercel HTTPS
+    SESSION_COOKIE_NAME = "circular_session"
+    SESSION_COOKIE_HTTPONLY = True
+    SESSION_COOKIE_SECURE = IS_PRODUCTION or (IS_VERCEL and VERCEL_ENV != "development")
+    SESSION_COOKIE_SAMESITE = "Lax"
+    PERMANENT_SESSION_LIFETIME = timedelta(days=7)
 
     MAX_CONTENT_LENGTH = int(os.environ.get("MAX_CONTENT_LENGTH", 16 * 1024 * 1024))
 
@@ -163,6 +176,8 @@ class TestConfig(Config):
     """Testing configuration."""
     TESTING = True
     IS_PRODUCTION = False
+    IS_VERCEL = False
+    SESSION_COOKIE_SECURE = False
     SECRET_KEY = "test-only-secret-key"
     SQLALCHEMY_DATABASE_URI = "sqlite:///:memory:"
     BACKEND_URL = "http://internal-backend"

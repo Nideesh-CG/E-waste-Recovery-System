@@ -1985,6 +1985,178 @@ class CircularTests(unittest.TestCase):
         with self.app.app_context():
             self.assertEqual(Transfer.query.count(), initial_transfer_count + 1)
 
+    def test_registration_csrf_token_rendered(self):
+        """Test 1: Registration page renders a valid CSRF token in both meta and form."""
+        res = self.client.get("/register")
+        self.assertEqual(res.status_code, 200)
+        html = soup(res.data.decode("utf-8"))
+        form_csrf = html.select_one("form input[name='csrf']")
+        self.assertIsNotNone(form_csrf, "Registration form must include hidden csrf input")
+        self.assertTrue(len(form_csrf.get("value", "")) >= 32)
+        meta_csrf = html.select_one("meta[name='csrf-token']")
+        self.assertIsNotNone(meta_csrf, "Page head must include meta csrf-token")
+        self.assertEqual(form_csrf["value"], meta_csrf["content"])
+        with self.client.session_transaction() as sess:
+            self.assertEqual(sess.get("csrf"), form_csrf["value"])
+
+    def test_registration_valid_submission_succeeds(self):
+        """Test 2: Valid registration form submission with valid CSRF token succeeds."""
+        token = self.token()
+        payload = {
+            "csrf": token,
+            "Device Type": "Smartphone",
+            "Brand": "Apple",
+            "Model": "iPhone 13",
+            "Purchase Year": "2022",
+            "Condition": "Good",
+            "Estimated Weight": "0.18",
+            "Power Status": "Powers on",
+            "Screen Condition": "Working",
+            "Battery Condition": "Good",
+            "Damage Description": "None"
+        }
+        res = self.client.post("/register", data=payload, follow_redirects=False)
+        self.assertEqual(res.status_code, 302)
+        self.assertTrue(res.headers.get("Location", "").startswith("/devices/EW-"))
+        with self.app.app_context():
+            dev = Device.query.filter_by(brand="Apple", model="iPhone 13").first()
+            self.assertIsNotNone(dev)
+            self.assertEqual(dev.type, "Smartphone")
+
+    def test_registration_missing_csrf_token_rejected(self):
+        """Test 3: Missing CSRF token is rejected with 400."""
+        self.client.get("/register")  # establish session
+        payload = {
+            "Device Type": "Smartphone",
+            "Brand": "Apple",
+            "Model": "iPhone 13",
+            "Purchase Year": "2022",
+            "Condition": "Good",
+            "Estimated Weight": "0.18",
+            "Power Status": "Powers on",
+        }
+        res = self.client.post("/register", data=payload)
+        self.assertEqual(res.status_code, 400)
+        self.assertIn(b"Security Token Expired", res.data)
+
+    def test_registration_invalid_csrf_token_rejected(self):
+        """Test 4: Invalid CSRF token is rejected with 400."""
+        self.client.get("/register")  # establish session
+        payload = {
+            "csrf": "invalid-random-token-12345",
+            "Device Type": "Smartphone",
+            "Brand": "Apple",
+            "Model": "iPhone 13",
+            "Purchase Year": "2022",
+            "Condition": "Good",
+            "Estimated Weight": "0.18",
+            "Power Status": "Powers on",
+        }
+        res = self.client.post("/register", data=payload)
+        self.assertEqual(res.status_code, 400)
+        self.assertIn(b"Security Token Expired", res.data)
+
+    def test_registration_expired_session_handled(self):
+        """Test 5: Expired/missing session cookie is rejected gracefully with 400."""
+        fresh_client = self.app.test_client()
+        payload = {
+            "csrf": "previously-minted-token-without-cookie",
+            "Device Type": "Smartphone",
+            "Brand": "Apple",
+            "Model": "iPhone 13",
+            "Purchase Year": "2022",
+            "Condition": "Good",
+            "Estimated Weight": "0.18",
+            "Power Status": "Powers on",
+        }
+        res = fresh_client.post("/register", data=payload)
+        self.assertEqual(res.status_code, 400)
+        self.assertIn(b"Security Token Expired", res.data)
+
+    def test_registration_refresh_page_works(self):
+        """Test 6: Form submission works after page refresh."""
+        self.client.get("/register")
+        res_refresh = self.client.get("/register")
+        self.assertEqual(res_refresh.status_code, 200)
+        refreshed_html = soup(res_refresh.data.decode("utf-8"))
+        form_csrf = refreshed_html.select_one("form input[name='csrf']")["value"]
+
+        payload = {
+            "csrf": form_csrf,
+            "Device Type": "Monitor",
+            "Brand": "Dell",
+            "Model": "UltraSharp",
+            "Purchase Year": "2021",
+            "Condition": "Minor damage",
+            "Estimated Weight": "4.2",
+            "Power Status": "Powers on",
+        }
+        res = self.client.post("/register", data=payload, follow_redirects=False)
+        self.assertEqual(res.status_code, 302)
+        self.assertTrue(res.headers.get("Location", "").startswith("/devices/EW-"))
+
+    def test_registration_ajax_header_csrf_succeeds(self):
+        """Test 7: AJAX submission with X-CSRF-Token header is accepted."""
+        token = self.token()
+        headers = {"X-CSRF-Token": token}
+        payload = {
+            "Device Type": "Tablet",
+            "Brand": "Samsung",
+            "Model": "Galaxy Tab",
+            "Purchase Year": "2023",
+            "Condition": "Good",
+            "Estimated Weight": "0.45",
+            "Power Status": "Powers on",
+        }
+        res = self.client.post("/register", data=payload, headers=headers, follow_redirects=False)
+        self.assertEqual(res.status_code, 302)
+
+    def test_multi_tab_csrf_reuse_works(self):
+        """Test 8: Multiple requests/tabs share valid session-scoped CSRF token."""
+        res1 = self.client.get("/register")
+        res2 = self.client.get("/register")
+        html1 = soup(res1.data.decode("utf-8"))
+        html2 = soup(res2.data.decode("utf-8"))
+        token1 = html1.select_one("form input[name='csrf']")["value"]
+        token2 = html2.select_one("form input[name='csrf']")["value"]
+        self.assertEqual(token1, token2, "Multiple tabs should share session CSRF token without invalidation")
+
+    def test_api_endpoints_exempt_from_csrf(self):
+        """Test 9: API endpoints are exempt from form CSRF checks."""
+        res_health = self.client.get("/api/health")
+        self.assertEqual(res_health.status_code, 200)
+
+        asmt_headers = {
+            "Content-Type": "application/json",
+            "X-API-Key": "test-circular-secret",
+        }
+        res_asmt = self.client.post(
+            "/api/v1/assessment-results",
+            data=json.dumps({"device_id": "non-existent-device"}),
+            headers=asmt_headers
+        )
+        self.assertEqual(res_asmt.status_code, 404)
+
+    def test_production_session_and_proxyfix_configuration(self):
+        """Test 10: Production session cookies and ProxyFix configuration."""
+        from datetime import timedelta
+        from config import Config
+        self.assertEqual(Config.SESSION_COOKIE_NAME, "circular_session")
+        self.assertTrue(Config.SESSION_COOKIE_HTTPONLY)
+        self.assertEqual(Config.SESSION_COOKIE_SAMESITE, "Lax")
+        self.assertEqual(Config.PERMANENT_SESSION_LIFETIME, timedelta(days=7))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_db = Path(temp_dir) / "prod_test.sqlite3"
+            with patch.dict(os.environ, {
+                "IS_PRODUCTION": "true",
+                "CIRCULAR_SECRET_KEY": "prod-secret-12345",
+                "CIRCULAR_API_KEY": "api-key-12345"
+            }):
+                prod_app = create_app(temp_db)
+                from werkzeug.middleware.proxy_fix import ProxyFix
+                self.assertIsInstance(prod_app.wsgi_app, ProxyFix)
+
 
 if __name__ == "__main__":
     unittest.main()
