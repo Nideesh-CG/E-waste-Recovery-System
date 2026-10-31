@@ -2881,6 +2881,93 @@ class Phase10IntegrationTests(unittest.TestCase):
             self.assertIn("signed_url", file_meta)
             self.assertEqual(file_meta["signed_url"], "https://test.supabase.co/storage/v1/object/sign/ewaste-files/signed-path?token=xyz")
 
+    def test_21_database_schema_and_migration_verifier_scripts(self):
+        """21. Diagnostic scripts check_database_schema.py and verify_migrations.py run successfully."""
+        import subprocess
+
+        py_exe = sys.executable
+        root = Path(__file__).resolve().parent.parent
+
+        # Verify migrations chain script
+        verify_script = root / "scripts" / "verify_migrations.py"
+        self.assertTrue(verify_script.is_file())
+        res_m = subprocess.run([py_exe, str(verify_script)], capture_output=True, text=True)
+        self.assertEqual(res_m.returncode, 0, f"verify_migrations failed:\n{res_m.stdout}\n{res_m.stderr}")
+        self.assertIn("Linear migration chain verified with active head 'b7a8c9d0e1f2'", res_m.stdout)
+
+        # Verify schema check script with test database
+        check_script = root / "scripts" / "check_database_schema.py"
+        self.assertTrue(check_script.is_file())
+        env = os.environ.copy()
+        env["DATABASE_URL"] = f"sqlite:///{self.database}"
+        res_s = subprocess.run([py_exe, str(check_script)], capture_output=True, text=True, env=env)
+        self.assertEqual(res_s.returncode, 0, f"check_database_schema failed:\n{res_s.stdout}\n{res_s.stderr}")
+        self.assertIn("ALL SCHEMAS, TABLES, AND COLUMNS MATCH AUTHORITATIVE MODELS", res_s.stdout)
+
+    def test_22_sql_init_authoritative_columns_and_reconciliation(self):
+        """22. collection_schema_init.sql contains authoritative columns, reconciliation block, and stamps head revision."""
+        root = Path(__file__).resolve().parent.parent
+        sql_file = root / "migrations" / "collection_schema_init.sql"
+        self.assertTrue(sql_file.is_file())
+        content = sql_file.read_text(encoding="utf-8")
+
+        # Authoritative columns in collection.devices definition
+        required_device_cols = ["date VARCHAR(32)", "year VARCHAR(8)", "weight VARCHAR(16)", "damage TEXT", "power VARCHAR(64)", "screen VARCHAR(64)", "battery VARCHAR(64)"]
+        for col in required_device_cols:
+            self.assertIn(col, content)
+
+        # Reconciliation / backfill block
+        self.assertIn("ALTER TABLE collection.devices ADD COLUMN IF NOT EXISTS date VARCHAR(32)", content)
+        self.assertIn("ALTER TABLE collection.devices ADD COLUMN IF NOT EXISTS year VARCHAR(8)", content)
+        self.assertIn("ALTER TABLE collection.devices ADD COLUMN IF NOT EXISTS weight VARCHAR(16)", content)
+        self.assertIn("purchase_year", content)
+        self.assertIn("weight_kg", content)
+        self.assertIn("damage_description", content)
+
+        # Alembic version table and stamping head revision
+        self.assertIn("CREATE TABLE IF NOT EXISTS collection.alembic_version", content)
+        self.assertIn("INSERT INTO collection.alembic_version (version_num) VALUES ('b7a8c9d0e1f2')", content)
+
+    def test_23_metrics_exception_logging_and_no_fabricated_data(self):
+        """23. metrics.py logs errors with traceback and raises without fabricating data."""
+        from metrics import get_platform_metrics
+
+        with self.app.app_context():
+            # Normal calculation works cleanly
+            m = get_platform_metrics()
+            self.assertIsInstance(m, dict)
+            self.assertIn("total_devices", m)
+            self.assertIn("circular_recovery_rate", m)
+
+            # When database error occurs, verify it logs and raises instead of concealing
+            with patch("models.Device.query") as mock_q:
+                mock_q.count.side_effect = Exception("psycopg.errors.UndefinedColumn: column devices.date does not exist")
+                with self.assertLogs("metrics", level="ERROR") as cm:
+                    with self.assertRaises(Exception) as exc_ctx:
+                        get_platform_metrics()
+                    self.assertIn("column devices.date does not exist", str(exc_ctx.exception))
+                    self.assertTrue(any("Database error occurred while calculating platform metrics" in log for log in cm.output))
+
+    def test_24_authoritative_models_columns_consistency(self):
+        """24. Models strictly expose authoritative columns matching API contract and database schemas."""
+        from models import Device, Transfer, AssessmentResult, DeviceFile, Metadata
+
+        dev_cols = {c.name for c in Device.__table__.columns}
+        expected_dev = {"id", "name", "type", "brand", "model", "status", "date", "condition", "year", "weight", "damage", "power", "screen", "battery", "image", "document", "created_at"}
+        self.assertEqual(expected_dev, dev_cols)
+
+        trf_cols = {c.name for c in Transfer.__table__.columns}
+        expected_trf = {"id", "device_id", "file", "sender", "receiver", "status", "time", "timestamp", "http_status", "response_body", "endpoint", "payload", "retry_count", "idempotency_key"}
+        self.assertEqual(expected_trf, trf_cols)
+
+        asmt_cols = {c.name for c in AssessmentResult.__table__.columns}
+        expected_asmt = {"id", "device_id", "repairability_score", "circular_recovery_score", "repair_cost", "component_value", "recommendation", "co2_avoided_kg", "assessed_by", "notes", "factors", "assessed_at"}
+        self.assertEqual(expected_asmt, asmt_cols)
+
+        file_cols = {c.name for c in DeviceFile.__table__.columns}
+        expected_file = {"id", "device_id", "file_type", "filename", "original_filename", "storage_key", "file_path", "content_type", "file_size", "storage_provider", "is_private", "created_at"}
+        self.assertEqual(expected_file, file_cols)
+
 
 if __name__ == "__main__":
     unittest.main()

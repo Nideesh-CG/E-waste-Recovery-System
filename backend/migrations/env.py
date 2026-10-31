@@ -51,6 +51,19 @@ def get_metadata():
     return target_db.metadata
 
 
+def include_object(object, name, type_, reflected, compare_to):
+    if type_ == "table":
+        try:
+            engine = get_engine()
+            if engine.dialect.name == "sqlite":
+                return True
+        except Exception:
+            pass
+        if object.schema != "collection":
+            return False
+    return True
+
+
 def run_migrations_offline():
     """Run migrations in 'offline' mode.
 
@@ -64,13 +77,17 @@ def run_migrations_offline():
 
     """
     url = config.get_main_option("sqlalchemy.url")
-    context.configure(
-        url=url,
-        target_metadata=get_metadata(),
-        literal_binds=True,
-        version_table_schema="collection",
-        include_schemas=True,
-    )
+    is_sqlite = url.startswith("sqlite")
+    cfg_kw = {
+        "url": url,
+        "target_metadata": get_metadata(),
+        "literal_binds": True,
+        "include_object": include_object,
+    }
+    if not is_sqlite:
+        cfg_kw["version_table_schema"] = "collection"
+        cfg_kw["include_schemas"] = True
+    context.configure(**cfg_kw)
 
     with context.begin_transaction():
         context.run_migrations()
@@ -94,16 +111,15 @@ def run_migrations_online():
                 directives[:] = []
                 logger.info('No changes in schema detected.')
 
-    def include_object(object, name, type_, reflected, compare_to):
-        if type_ == "table" and object.schema and object.schema != "collection":
-            return False
-        return True
+    connectable = get_engine()
+    is_sqlite = (connectable.dialect.name == "sqlite")
 
     conf_args = current_app.extensions['migrate'].configure_args
     if conf_args.get("process_revision_directives") is None:
         conf_args["process_revision_directives"] = process_revision_directives
-    conf_args.setdefault("version_table_schema", "collection")
-    conf_args.setdefault("include_schemas", True)
+    if not is_sqlite:
+        conf_args.setdefault("version_table_schema", "collection")
+        conf_args.setdefault("include_schemas", True)
     conf_args.setdefault("include_object", include_object)
 
     connectable = get_engine()
