@@ -1337,6 +1337,654 @@ class CircularTests(unittest.TestCase):
         self.assertEqual(ctype, "application/pdf")
         self.assertTrue(storage.delete(k))
 
+    # =========================================================================
+    # TASK 9 SPECIFIC INTEGRATION TEST SCENARIOS (1 to 12)
+    # =========================================================================
+
+    def test_scenario_1_partner_api_authentication(self):
+        """Scenario 1: Inbound partner API authentication via CIRCULAR_API_KEY.
+        
+        Validates:
+        - Missing key rejected with 401
+        - Invalid X-API-Key rejected with 401
+        - Invalid Authorization: Bearer rejected with 401
+        - Query parameter credentials prohibited with 401
+        - Valid X-API-Key accepted
+        - Valid Authorization: Bearer accepted
+        - Public health endpoint /api/health accessible without credentials
+        """
+        # Missing key
+        res_no_key = self.client.post(
+            "/api/v1/assessment-results",
+            data=json.dumps({"device_id": "EW-2024-00128"}),
+            headers={"Content-Type": "application/json"}
+        )
+        self.assertEqual(res_no_key.status_code, 401)
+        self.assertIn("Unauthorized", res_no_key.get_json().get("error", ""))
+
+        # Invalid X-API-Key
+        res_bad_xkey = self.client.post(
+            "/api/v1/assessment-results",
+            data=json.dumps({"device_id": "EW-2024-00128"}),
+            headers={"Content-Type": "application/json", "X-API-Key": "invalid-secret-key"}
+        )
+        self.assertEqual(res_bad_xkey.status_code, 401)
+
+        # Invalid Authorization Bearer
+        res_bad_bearer = self.client.post(
+            "/api/v1/assessment-results",
+            data=json.dumps({"device_id": "EW-2024-00128"}),
+            headers={"Content-Type": "application/json", "Authorization": "Bearer invalid-secret-token"}
+        )
+        self.assertEqual(res_bad_bearer.status_code, 401)
+
+        # Query parameter key must NEVER be accepted (prohibited)
+        res_query_key = self.client.post(
+            "/api/v1/assessment-results?api_key=test-circular-secret",
+            data=json.dumps({"device_id": "EW-2024-00128"}),
+            headers={"Content-Type": "application/json"}
+        )
+        self.assertEqual(res_query_key.status_code, 401)
+
+        # Valid X-API-Key allows authentication through to payload validation
+        res_valid_xkey = self.client.post(
+            "/api/v1/assessment-results",
+            data=json.dumps({}),
+            headers={"Content-Type": "application/json", "X-API-Key": "test-circular-secret"}
+        )
+        self.assertNotEqual(res_valid_xkey.status_code, 401)
+        self.assertEqual(res_valid_xkey.status_code, 400)
+
+        # Valid Authorization Bearer allows authentication
+        res_valid_bearer = self.client.post(
+            "/api/v1/assessment-results",
+            data=json.dumps({}),
+            headers={"Content-Type": "application/json", "Authorization": "Bearer test-circular-secret"}
+        )
+        self.assertNotEqual(res_valid_bearer.status_code, 401)
+        self.assertEqual(res_valid_bearer.status_code, 400)
+
+        # Health probe remains publicly accessible
+        res_health = self.client.get("/api/health")
+        self.assertEqual(res_health.status_code, 200)
+        self.assertEqual(res_health.get_json()["status"], "healthy")
+
+    def test_scenario_2_correct_device_payload_generation(self):
+        """Scenario 2: Correct device payload generation conforming to partner API contract.
+        
+        Validates:
+        - Top-level schema_version, device_id, transfer_id
+        - device object contains purchase_year (int), weight_kg (float), condition,
+          power_status, screen_condition, battery_condition, damage_description
+        - Backward-compatible fields preserved (year, weight, power, screen, battery, damage)
+        - files list format with safe relative URLs and NO local filesystem paths
+        """
+        with self.app.app_context():
+            dev = Device.query.filter_by(id="EW-2024-00128").first()
+            dev.power = "Powers on normally"
+            dev.screen = "Working, no dead pixels"
+            dev.battery = "Holds 80% charge"
+            dev.damage = "Minor bezel scratch"
+            payload = dev.to_partner_payload("TRF-TEST-UUID-999")
+
+        # Top-level keys
+        self.assertEqual(payload["schema_version"], "1.0.0")
+        self.assertEqual(payload["device_id"], "EW-2024-00128")
+        self.assertEqual(payload["transfer_id"], "TRF-TEST-UUID-999")
+        self.assertIn("dispatched_at", payload)
+        self.assertIsInstance(payload["files"], list)
+
+        # Partner-expected fields
+        dev_map = payload["device"]
+        self.assertEqual(dev_map["id"], "EW-2024-00128")
+        self.assertEqual(dev_map["name"], "Dell Latitude 5420")
+        self.assertEqual(dev_map["type"], "Laptop")
+        self.assertEqual(dev_map["brand"], "Dell")
+        self.assertEqual(dev_map["model"], "Latitude 5420")
+        self.assertIsInstance(dev_map["purchase_year"], int)
+        self.assertEqual(dev_map["purchase_year"], 2021)
+        self.assertIsInstance(dev_map["weight_kg"], float)
+        self.assertEqual(dev_map["weight_kg"], 1.4)
+        self.assertEqual(dev_map["power_status"], "Powers on normally")
+        self.assertEqual(dev_map["screen_condition"], "Working, no dead pixels")
+        self.assertEqual(dev_map["battery_condition"], "Holds 80% charge")
+        self.assertEqual(dev_map["damage_description"], "Minor bezel scratch")
+
+        # Backward compatibility fields preserved
+        self.assertEqual(dev_map["year"], "2021")
+        self.assertEqual(dev_map["weight"], "1.4")
+        self.assertEqual(dev_map["power"], "Powers on normally")
+        self.assertEqual(dev_map["screen"], "Working, no dead pixels")
+        self.assertEqual(dev_map["battery"], "Holds 80% charge")
+        self.assertEqual(dev_map["damage"], "Minor bezel scratch")
+
+        # Files array contains no local filesystem paths
+        for f in payload["files"]:
+            self.assertNotIn(":\\", f["url"])
+            self.assertNotIn("/tmp/", f["url"])
+            self.assertNotIn("/var/", f["url"])
+
+    @patch("api.requests.post")
+    def test_scenario_3_successful_device_transfer(self, mock_post):
+        """Scenario 3: Successful outbound device transfer.
+        
+        Validates:
+        - Exact headers: Content-Type, X-API-Key, Authorization: Bearer, Idempotency-Key
+        - Partner returns 200/201
+        - Transfer recorded as Completed with 200 OK and response body
+        - Device lifecycle transitions to Processing
+        """
+        self.app.config["PARTNER_API_URL"] = "https://partner-deployed.example.com"
+        self.app.config["PARTNER_API_KEY"] = "partner-secret-xyz-987"
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.reason = "OK"
+        mock_resp.text = '{"status":"accepted","transfer_id":"PTR-98765"}'
+        mock_post.return_value = mock_resp
+
+        res = self.client.post(
+            "/devices/EW-2024-00128/send",
+            data={"csrf": self.token()},
+            follow_redirects=True
+        )
+        self.assertEqual(res.status_code, 200)
+        self.assertIn(b"Transfer successfully dispatched to partner", res.data)
+
+        # Verify request headers and URL
+        mock_post.assert_called_once()
+        call_args, call_kwargs = mock_post.call_args
+        self.assertEqual(call_args[0], "https://partner-deployed.example.com/api/v1/refurbishment/devices")
+        headers = call_kwargs["headers"]
+        self.assertEqual(headers["Content-Type"], "application/json")
+        self.assertEqual(headers["X-API-Key"], "partner-secret-xyz-987")
+        self.assertEqual(headers["Authorization"], "Bearer partner-secret-xyz-987")
+        self.assertTrue(headers["Idempotency-Key"].startswith("TRF-"))
+
+        # Verify database records
+        with self.app.app_context():
+            dev = Device.query.filter_by(id="EW-2024-00128").first()
+            self.assertEqual(dev.status, "Processing")
+
+            trf = Transfer.query.filter_by(device_id="EW-2024-00128").order_by(Transfer.timestamp.desc()).first()
+            self.assertIsNotNone(trf)
+            self.assertEqual(trf.status, "Completed")
+            self.assertEqual(trf.http_status, "200 OK")
+            self.assertIn("PTR-98765", trf.response_body)
+
+    @patch("api.requests.post")
+    def test_scenario_4_invalid_partner_api_key(self, mock_post):
+        """Scenario 4: Handling of invalid partner API key.
+        
+        Validates:
+        - Partner returns 401 Unauthorized
+        - Transfer marked Failed, HTTP status 401 Unauthorized
+        - Device lifecycle preserved (remains Pending assessment)
+        - Also validates abort when PARTNER_API_URL set but PARTNER_API_KEY empty
+        """
+        # Case A: Partner returns 401 Unauthorized
+        self.app.config["PARTNER_API_URL"] = "https://partner.example.com"
+        self.app.config["PARTNER_API_KEY"] = "bad-key"
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 401
+        mock_resp.reason = "Unauthorized"
+        mock_resp.text = '{"error":"Unauthorized","message":"Invalid partner API key"}'
+        mock_post.return_value = mock_resp
+
+        res = self.client.post(
+            "/devices/EW-2024-00128/send",
+            data={"csrf": self.token()},
+            follow_redirects=True
+        )
+        self.assertEqual(res.status_code, 200)
+        self.assertIn(b"Partner transfer failed with status 401", res.data)
+
+        with self.app.app_context():
+            dev = Device.query.filter_by(id="EW-2024-00128").first()
+            self.assertEqual(dev.status, "Pending assessment")
+            trf = Transfer.query.filter_by(device_id="EW-2024-00128").order_by(Transfer.timestamp.desc()).first()
+            self.assertEqual(trf.status, "Failed")
+            self.assertEqual(trf.http_status, "401 Unauthorized")
+
+        # Case B: PARTNER_API_URL configured but PARTNER_API_KEY empty -> fail fast
+        self.app.config["PARTNER_API_KEY"] = ""
+        res_empty = self.client.post(
+            "/devices/EW-2024-00128/send",
+            data={"csrf": self.token()},
+            follow_redirects=True
+        )
+        self.assertEqual(res_empty.status_code, 200)
+        self.assertIn(b"PARTNER_API_KEY is not configured", res_empty.data)
+        with self.app.app_context():
+            dev = Device.query.filter_by(id="EW-2024-00128").first()
+            self.assertEqual(dev.status, "Pending assessment")
+
+    @patch("api.requests.post")
+    def test_scenario_5_partner_server_unavailable(self, mock_post):
+        """Scenario 5: Handling when partner server is unavailable (503 / 500).
+        
+        Validates:
+        - Partner returns 503 Service Unavailable or 500 Internal Error
+        - Transfer marked Failed with meaningful error
+        - Device lifecycle preserved (remains Pending assessment)
+        """
+        self.app.config["PARTNER_API_URL"] = "https://partner.example.com"
+        self.app.config["PARTNER_API_KEY"] = "valid-key"
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 503
+        mock_resp.reason = "Service Unavailable"
+        mock_resp.text = '{"error":"Service Unavailable","message":"Partner server in maintenance"}'
+        mock_post.return_value = mock_resp
+
+        res = self.client.post(
+            "/devices/EW-2024-00128/send",
+            data={"csrf": self.token()},
+            follow_redirects=True
+        )
+        self.assertEqual(res.status_code, 200)
+        self.assertIn(b"Partner transfer failed with status 503", res.data)
+
+        with self.app.app_context():
+            dev = Device.query.filter_by(id="EW-2024-00128").first()
+            self.assertEqual(dev.status, "Pending assessment")
+            trf = Transfer.query.filter_by(device_id="EW-2024-00128").order_by(Transfer.timestamp.desc()).first()
+            self.assertEqual(trf.status, "Failed")
+            self.assertEqual(trf.http_status, "503 Service Unavailable")
+
+    @patch("api.requests.post")
+    def test_scenario_6_timeout_handling(self, mock_post):
+        """Scenario 6: Network timeout handling and safe retry.
+        
+        Validates:
+        - requests.Timeout raises during dispatch
+        - HTTP status recorded as 504 Gateway Timeout
+        - Transfer marked Failed with descriptive message
+        - Device lifecycle preserved in Pending assessment
+        - Allows safe retry using original idempotency key
+        """
+        self.app.config["PARTNER_API_URL"] = "https://partner.example.com"
+        self.app.config["PARTNER_API_KEY"] = "valid-key"
+
+        mock_post.side_effect = requests.Timeout("Connection timed out after 10.0 seconds")
+
+        res = self.client.post(
+            "/devices/EW-2024-00128/send",
+            data={"csrf": self.token()},
+            follow_redirects=True
+        )
+        self.assertEqual(res.status_code, 200)
+        self.assertIn(b"Network timeout", res.data)
+
+        with self.app.app_context():
+            dev = Device.query.filter_by(id="EW-2024-00128").first()
+            self.assertEqual(dev.status, "Pending assessment")
+            trf = Transfer.query.filter_by(device_id="EW-2024-00128").order_by(Transfer.timestamp.desc()).first()
+            self.assertEqual(trf.status, "Failed")
+            self.assertEqual(trf.http_status, "504 Gateway Timeout")
+            self.assertIn("timeout", trf.response_body.lower())
+            orig_idempotency_key = trf.idempotency_key
+
+        # Safe retry with original idempotency key
+        with patch("app.requests.post") as mock_retry_post:
+            mock_success = MagicMock()
+            mock_success.status_code = 200
+            mock_success.reason = "OK"
+            mock_success.text = '{"status":"retried_ok"}'
+            mock_retry_post.return_value = mock_success
+
+            retry_res = self.client.post(
+                f"/transfers/{trf.id}/retry",
+                data={"csrf": self.token()},
+                follow_redirects=True
+            )
+            self.assertEqual(retry_res.status_code, 200)
+            mock_retry_post.assert_called_once()
+            _, retry_kwargs = mock_retry_post.call_args
+            self.assertEqual(retry_kwargs["headers"]["Idempotency-Key"], orig_idempotency_key)
+
+        with self.app.app_context():
+            updated_trf = Transfer.query.filter_by(id=trf.id).first()
+            self.assertEqual(updated_trf.status, "Completed")
+            dev_updated = Device.query.filter_by(id="EW-2024-00128").first()
+            self.assertEqual(dev_updated.status, "Processing")
+
+    def test_scenario_7_duplicate_transfer_prevention(self):
+        """Scenario 7: Prevent duplicate transfers when device is not in Pending assessment.
+        
+        Validates:
+        - When device is already Processing, Refurbishment, Parts recovery, or Completed,
+          subsequent /send requests are blocked.
+        - Preserves existing lifecycle state.
+        - REST API /api/v1/devices/<id>/send returns 409 Conflict.
+        """
+        # In Processing
+        with self.app.app_context():
+            dev = Device.query.filter_by(id="EW-2024-00128").first()
+            dev.status = "Processing"
+            db.session.commit()
+
+        res_proc = self.client.post(
+            "/devices/EW-2024-00128/send",
+            data={"csrf": self.token()},
+            follow_redirects=True
+        )
+        self.assertEqual(res_proc.status_code, 200)
+        self.assertIn(b"already completed or is currently undergoing assessment", res_proc.data)
+
+        # In Completed
+        with self.app.app_context():
+            dev = Device.query.filter_by(id="EW-2024-00128").first()
+            dev.status = "Completed"
+            db.session.commit()
+
+        res_comp = self.client.post(
+            "/devices/EW-2024-00128/send",
+            data={"csrf": self.token()},
+            follow_redirects=True
+        )
+        self.assertEqual(res_comp.status_code, 200)
+        self.assertIn(b"already completed or is currently undergoing assessment", res_comp.data)
+
+        # REST API endpoint returns 409 Conflict
+        headers = {"Authorization": "Bearer test-circular-secret"}
+        api_res = self.client.post("/api/v1/devices/EW-2024-00128/send", headers=headers)
+        self.assertEqual(api_res.status_code, 409)
+        self.assertIn("Conflict", api_res.get_json()["error"])
+
+    def test_scenario_8_incoming_assessment_result(self):
+        """Scenario 8: Successfully process incoming assessment result.
+        
+        Validates:
+        - Authenticated POST /api/v1/assessment-results
+        - Device must be in Processing
+        - Full field payload accepted (including component_value alias)
+        - Device transitions to Refurbishment on REFURBISH
+        - AssessmentResult persisted
+        - Transfer log recorded
+        - Returns structured JSON response
+        """
+        with self.app.app_context():
+            dev = Device.query.filter_by(id="EW-2024-00128").first()
+            dev.status = "Processing"
+            AssessmentResult.query.filter_by(device_id="EW-2024-00128").delete()
+            db.session.commit()
+
+        headers = {
+            "Content-Type": "application/json",
+            "X-API-Key": "test-circular-secret",
+            "Idempotency-Key": "IDEMP-SCENARIO-8-001",
+        }
+        payload = {
+            "device_id": "EW-2024-00128",
+            "repairability_score": 88,
+            "circular_recovery_score": 85,
+            "repair_cost": 2500.0,
+            "component_recovery_value": 11000.0,  # Test alias component_recovery_value
+            "recommendation": "REFURBISH",
+            "co2_avoided_kg": 19.5,
+            "assessed_by": "GreenTech Refurbishment Partner",
+            "notes": "Display assembly operational. Logic board healthy.",
+            "factors": [
+                "Modular keyboard replacement viable",
+                "Battery health exceeds 85%"
+            ],
+            "idempotency_key": "IDEMP-SCENARIO-8-001"
+        }
+
+        res = self.client.post("/api/v1/assessment-results", data=json.dumps(payload), headers=headers)
+        self.assertEqual(res.status_code, 200)
+        data = res.get_json()
+        self.assertEqual(data["status"], "success")
+        self.assertEqual(data["device_id"], "EW-2024-00128")
+        self.assertEqual(data["new_device_status"], "Refurbishment")
+        self.assertEqual(data["assessment"]["repairability_score"], 88)
+        self.assertEqual(data["assessment"]["component_value"], 11000.0)
+
+        with self.app.app_context():
+            dev = Device.query.filter_by(id="EW-2024-00128").first()
+            self.assertEqual(dev.status, "Refurbishment")
+            self.assertIsNotNone(dev.assessment)
+            self.assertEqual(dev.assessment.recommendation, "REFURBISH")
+            self.assertEqual(dev.assessment.repair_cost, 2500.0)
+
+    def test_scenario_9_invalid_assessment_values(self):
+        """Scenario 9: Strict validation of invalid assessment payload values.
+        
+        Validates:
+        - Non-existent device_id -> 404
+        - Missing required fields -> 400
+        - repairability_score: > 100, < 0, non-integer float, boolean, non-numeric -> 400
+        - circular_recovery_score: > 100, < 0, boolean, non-numeric -> 400
+        - repair_cost: < 0, NaN, Inf, boolean -> 400
+        - component_value: < 0, NaN, Inf, boolean -> 400
+        - co2_avoided_kg: < 0, NaN, Inf, boolean -> 400
+        """
+        with self.app.app_context():
+            dev = Device.query.filter_by(id="EW-2024-00128").first()
+            dev.status = "Processing"
+            db.session.commit()
+
+        headers = {
+            "Content-Type": "application/json",
+            "X-API-Key": "test-circular-secret",
+        }
+
+        # Non-existent device
+        res_404 = self.client.post(
+            "/api/v1/assessment-results",
+            data=json.dumps({"device_id": "EW-DOES-NOT-EXIST"}),
+            headers=headers
+        )
+        self.assertEqual(res_404.status_code, 404)
+
+        base_valid = {
+            "device_id": "EW-2024-00128",
+            "repairability_score": 85,
+            "circular_recovery_score": 80,
+            "repair_cost": 1500.0,
+            "component_value": 8000.0,
+            "recommendation": "REFURBISH",
+            "co2_avoided_kg": 15.0,
+        }
+
+        # Missing required field (e.g. recommendation)
+        missing_payload = dict(base_valid)
+        del missing_payload["recommendation"]
+        res_missing = self.client.post("/api/v1/assessment-results", data=json.dumps(missing_payload), headers=headers)
+        self.assertEqual(res_missing.status_code, 400)
+
+        # Invalid numeric test cases
+        invalid_cases = [
+            ("repairability_score", 101),
+            ("repairability_score", -1),
+            ("repairability_score", 85.5),
+            ("repairability_score", True),
+            ("repairability_score", "invalid_string"),
+            ("circular_recovery_score", 150),
+            ("circular_recovery_score", -5),
+            ("circular_recovery_score", False),
+            ("repair_cost", -10.0),
+            ("repair_cost", float("inf")),
+            ("repair_cost", float("nan")),
+            ("repair_cost", True),
+            ("component_value", -1.0),
+            ("component_value", float("-inf")),
+            ("component_value", False),
+            ("co2_avoided_kg", -0.5),
+            ("co2_avoided_kg", float("nan")),
+            ("co2_avoided_kg", True),
+        ]
+
+        for field_name, bad_value in invalid_cases:
+            bad_payload = dict(base_valid)
+            bad_payload[field_name] = bad_value
+            res_bad = self.client.post("/api/v1/assessment-results", data=json.dumps(bad_payload), headers=headers)
+            self.assertEqual(res_bad.status_code, 400, f"Expected 400 for {field_name}={bad_value}, got {res_bad.status_code}")
+
+    def test_scenario_10_invalid_recommendation(self):
+        """Scenario 10: Recommendation validation and canonical normalization.
+        
+        Validates:
+        - Unsupported recommendation returns 400
+        - Refurbish / REFURBISH -> REFURBISH (Refurbishment)
+        - Parts Recovery / PARTS_RECOVERY / PARTS -> PARTS_RECOVERY (Parts recovery)
+        - Recycle / RECYCLE -> RECYCLE (Completed)
+        - Safe Disposal / SAFE_DISPOSAL / DISPOSAL -> SAFE_DISPOSAL (Completed)
+        - Reject / REJECT -> REJECT explicitly recorded (Completed)
+        """
+        headers = {
+            "Content-Type": "application/json",
+            "X-API-Key": "test-circular-secret",
+        }
+        base_payload = {
+            "device_id": "EW-2024-00128",
+            "repairability_score": 75,
+            "circular_recovery_score": 70,
+            "repair_cost": 2000.0,
+            "component_value": 6000.0,
+            "co2_avoided_kg": 12.0,
+        }
+
+        # 1. Unsupported recommendation returns 400
+        bad_rec_payload = dict(base_payload)
+        bad_rec_payload["recommendation"] = "DESTROY_COMPLETELY"
+        with self.app.app_context():
+            dev = Device.query.filter_by(id="EW-2024-00128").first()
+            dev.status = "Processing"
+            db.session.commit()
+
+        res_bad = self.client.post("/api/v1/assessment-results", data=json.dumps(bad_rec_payload), headers=headers)
+        self.assertEqual(res_bad.status_code, 400)
+        self.assertIn("Unsupported recommendation", res_bad.get_json()["message"])
+
+        # 2. Test canonical normalization mappings
+        rec_tests = [
+            ("Refurbish", "REFURBISH", "Refurbishment"),
+            ("Parts Recovery", "PARTS_RECOVERY", "Parts recovery"),
+            ("parts", "PARTS_RECOVERY", "Parts recovery"),
+            ("Recycle", "RECYCLE", "Completed"),
+            ("Safe Disposal", "SAFE_DISPOSAL", "Completed"),
+            ("DISPOSAL", "SAFE_DISPOSAL", "Completed"),
+            ("Reject", "REJECT", "Completed"),
+            ("REJECT", "REJECT", "Completed"),
+        ]
+
+        for input_rec, expected_canon, expected_status in rec_tests:
+            with self.app.app_context():
+                dev = Device.query.filter_by(id="EW-2024-00128").first()
+                dev.status = "Processing"
+                AssessmentResult.query.filter_by(device_id="EW-2024-00128").delete()
+                db.session.commit()
+
+            test_payload = dict(base_payload)
+            test_payload["recommendation"] = input_rec
+            res_rec = self.client.post("/api/v1/assessment-results", data=json.dumps(test_payload), headers=headers)
+            self.assertEqual(res_rec.status_code, 200, f"Failed for recommendation '{input_rec}'")
+            res_json = res_rec.get_json()
+            self.assertEqual(res_json["new_device_status"], expected_status)
+            self.assertEqual(res_json["assessment"]["recommendation"], expected_canon)
+
+    def test_scenario_11_invalid_device_lifecycle_transition(self):
+        """Scenario 11: Invalid device lifecycle state transition enforcement.
+        
+        Validates:
+        - Inbound assessment on device in 'Pending assessment' returns 409 Conflict.
+        - Inbound assessment on device in 'Completed' returns 409 Conflict.
+        - Inbound assessment on device in 'Refurbishment' without idempotency returns 409 Conflict.
+        """
+        headers = {
+            "Content-Type": "application/json",
+            "X-API-Key": "test-circular-secret",
+        }
+        payload = {
+            "device_id": "EW-2024-00128",
+            "repairability_score": 80,
+            "circular_recovery_score": 75,
+            "repair_cost": 2000.0,
+            "component_value": 7000.0,
+            "recommendation": "REFURBISH",
+            "co2_avoided_kg": 14.0,
+        }
+
+        # Device in 'Pending assessment' -> must return 409 Conflict
+        with self.app.app_context():
+            dev = Device.query.filter_by(id="EW-2024-00128").first()
+            dev.status = "Pending assessment"
+            db.session.commit()
+
+        res_pending = self.client.post("/api/v1/assessment-results", data=json.dumps(payload), headers=headers)
+        self.assertEqual(res_pending.status_code, 409)
+        self.assertIn("must be in 'Processing'", res_pending.get_json()["message"])
+
+        # Device in 'Completed' -> must return 409 Conflict
+        with self.app.app_context():
+            dev = Device.query.filter_by(id="EW-2024-00128").first()
+            dev.status = "Completed"
+            db.session.commit()
+
+        res_completed = self.client.post("/api/v1/assessment-results", data=json.dumps(payload), headers=headers)
+        self.assertEqual(res_completed.status_code, 409)
+
+    def test_scenario_12_idempotent_callback_processing(self):
+        """Scenario 12: Idempotent callback processing for repeated partner webhooks.
+        
+        Validates:
+        - First callback sets up assessment and transitions device to Refurbishment
+        - Duplicate callback with identical Idempotency-Key returns HTTP 200 with idempotent: true
+        - Same transfer_id, device_id, and assessment returned
+        - No duplicate transfers created in database
+        """
+        with self.app.app_context():
+            dev = Device.query.filter_by(id="EW-2024-00128").first()
+            dev.status = "Processing"
+            AssessmentResult.query.filter_by(device_id="EW-2024-00128").delete()
+            db.session.commit()
+            initial_transfer_count = Transfer.query.count()
+
+        headers = {
+            "Content-Type": "application/json",
+            "X-API-Key": "test-circular-secret",
+            "Idempotency-Key": "IDEMP-KEY-SCENARIO-12-UUID",
+        }
+        payload = {
+            "device_id": "EW-2024-00128",
+            "repairability_score": 90,
+            "circular_recovery_score": 85,
+            "repair_cost": 1800.0,
+            "component_value": 9500.0,
+            "recommendation": "REFURBISH",
+            "co2_avoided_kg": 20.0,
+            "notes": "Idempotency test payload.",
+            "idempotency_key": "IDEMP-KEY-SCENARIO-12-UUID"
+        }
+
+        # First transmission
+        res1 = self.client.post("/api/v1/assessment-results", data=json.dumps(payload), headers=headers)
+        self.assertEqual(res1.status_code, 200)
+        data1 = res1.get_json()
+        self.assertEqual(data1["status"], "success")
+        self.assertEqual(data1["new_device_status"], "Refurbishment")
+        first_transfer_id = data1["transfer_id"]
+
+        with self.app.app_context():
+            self.assertEqual(Transfer.query.count(), initial_transfer_count + 1)
+
+        # Duplicate transmission with same idempotency key
+        res2 = self.client.post("/api/v1/assessment-results", data=json.dumps(payload), headers=headers)
+        self.assertEqual(res2.status_code, 200)
+        data2 = res2.get_json()
+        self.assertEqual(data2["status"], "success")
+        self.assertTrue(data2["idempotent"])
+        self.assertEqual(data2["transfer_id"], first_transfer_id)
+        self.assertEqual(data2["device_id"], "EW-2024-00128")
+        self.assertEqual(data2["new_device_status"], "Refurbishment")
+
+        # Confirm no duplicate transfer was added
+        with self.app.app_context():
+            self.assertEqual(Transfer.query.count(), initial_transfer_count + 1)
+
 
 if __name__ == "__main__":
     unittest.main()

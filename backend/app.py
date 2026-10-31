@@ -32,7 +32,7 @@ from flask import (
 from flask_migrate import Migrate
 from markupsafe import Markup
 
-from api import api_bp
+from api import api_bp, dispatch_device_to_partner
 from config import Config
 from metrics import get_platform_metrics
 from models import AssessmentResult, Device, DeviceFile, Metadata, Transfer, db
@@ -295,6 +295,19 @@ def create_app(database=None, config_class=None):
             current_year=now.year,
             backend_url=app.config.get("BACKEND_URL", ""),
         )
+
+    @app.before_request
+    def enforce_https_in_production():
+        if app.config.get("IS_PRODUCTION"):
+            proto = request.headers.get("X-Forwarded-Proto", "").lower()
+            if proto and proto != "https" and not request.is_secure:
+                if request.path.startswith("/api/"):
+                    return jsonify({
+                        "error": "Forbidden",
+                        "message": "HTTPS is strictly enforced in production."
+                    }), 403
+                url = request.url.replace("http://", "https://", 1)
+                return redirect(url, code=301)
 
     @app.before_request
     def protect_forms():
@@ -1114,118 +1127,13 @@ def create_app(database=None, config_class=None):
         if not device:
             abort(404)
 
-        # Validate lifecycle status allows dispatch
+        # Validate lifecycle status allows dispatch (prevents duplicate transfers)
         if device.status in ("Processing", "Refurbishment", "Parts recovery", "Completed"):
             flash("Device has already completed or is currently undergoing assessment.")
             return redirect("/devices/" + device_id)
 
-        transfer_id = f"TRF-{secrets.token_hex(4).upper()}"
-        file_name = f"{device.id}.json"
-        now = datetime.now(timezone.utc)
-
-        files_payload = []
-        for f in device.files:
-            file_url = f"/uploads/{f.storage_key}" if not f.is_private else f"/api/v1/files/{f.storage_key}"
-            files_payload.append({
-                "file_type": f.file_type,
-                "original_filename": f.original_filename,
-                "storage_key": f.storage_key,
-                "content_type": f.content_type,
-                "file_size": f.file_size,
-                "url": file_url,
-            })
-
-        payload = {
-            "schema_version": "1.0.0",
-            "transfer_id": transfer_id,
-            "device_id": device.id,
-            "device": {
-                "id": device.id,
-                "name": device.name,
-                "type": device.type,
-                "brand": device.brand,
-                "model": device.model,
-                "year": device.year,
-                "weight": device.weight,
-                "condition": device.condition,
-                "damage": device.damage or "",
-                "power": device.power or "",
-                "screen": device.screen or "",
-                "battery": device.battery or "",
-                "registered_date": device.date,
-            },
-            "files": files_payload,
-            "dispatched_at": datetime.now(timezone.utc).isoformat(),
-        }
-
-        partner_url = app.config.get("PARTNER_API_URL")
-        partner_key = app.config.get("PARTNER_API_KEY")
-
-        if partner_url:
-            if not partner_key:
-                # Requirement: If PARTNER_API_URL exists but PARTNER_API_KEY is missing,
-                # DO NOT send the request. Mark transfer failed. Do not move device to Processing.
-                target_endpoint = f"{partner_url}/api/v1/refurbishment/devices"
-                http_status = "401 Unauthorized"
-                response_body = "Missing PARTNER_API_KEY for configured PARTNER_API_URL. Transfer aborted."
-                transfer_status = "Failed"
-                flash("Partner transfer failed: PARTNER_API_KEY is not configured.")
-            else:
-                target_endpoint = f"{partner_url}/api/v1/refurbishment/devices"
-                headers = {
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {partner_key}",
-                    "X-API-Key": partner_key,
-                    "Idempotency-Key": transfer_id,
-                }
-                try:
-                    resp = requests.post(
-                        target_endpoint, json=payload, headers=headers, timeout=10
-                    )
-                    http_status = f"{resp.status_code} {resp.reason}"
-                    response_body = resp.text[:1000]
-                    if resp.status_code in (200, 201):
-                        transfer_status = "Completed"
-                        device.transition_to("Processing")
-                        flash("Transfer successfully dispatched to partner application.")
-                    elif resp.status_code == 202:
-                        transfer_status = "Processing"
-                        device.transition_to("Processing")
-                        flash("Transfer accepted by partner. Assessment in progress.")
-                    else:
-                        transfer_status = "Failed"
-                        flash(f"Partner transfer failed with status {resp.status_code}.")
-                except requests.RequestException as e:
-                    http_status = "503 Service Unavailable"
-                    response_body = f"Connection error: {str(e)}"
-                    transfer_status = "Failed"
-                    flash("Network error contacting partner. Transfer recorded as Failed.")
-        else:
-            target_endpoint = "POST /api/v1/refurbishment/devices"
-            http_status = "Not sent — awaiting dispatch"
-            response_body = "Demo transfer queued. No external API is connected."
-            transfer_status = "Pending"
-            # Phase 12: Device status MUST remain Pending assessment when PARTNER_API_URL is empty
-            flash("Demo transfer queued. No external API is connected.")
-
-        transfer = Transfer(
-            id=transfer_id,
-            device_id=device.id,
-            file=file_name,
-            sender="Collection",
-            receiver="Refurbishment",
-            status=transfer_status,
-            time=f"Today, {now.strftime('%I:%M %p')}",
-            timestamp=now,
-            http_status=http_status,
-            response_body=response_body,
-            endpoint=target_endpoint,
-            payload=json.dumps(payload),
-            idempotency_key=transfer_id,
-        )
-        db.session.add(transfer)
-        db.session.commit()
-
+        transfer, success, message = dispatch_device_to_partner(device)
+        flash(message)
         return redirect("/devices/" + device_id)
 
     @app.post("/transfers/<transfer_id>/retry")
@@ -1240,8 +1148,8 @@ def create_app(database=None, config_class=None):
             flash("Maximum retry attempts (5) reached for this transfer.")
             return redirect("/transfers")
 
-        partner_url = app.config.get("PARTNER_API_URL")
-        partner_key = app.config.get("PARTNER_API_KEY")
+        partner_url = (app.config.get("PARTNER_API_URL") or "").rstrip("/")
+        partner_key = app.config.get("PARTNER_API_KEY") or ""
 
         if partner_url and transfer.payload:
             if not partner_key:
@@ -1257,32 +1165,67 @@ def create_app(database=None, config_class=None):
                 )
                 headers = {
                     "Content-Type": "application/json",
-                    "Authorization": f"Bearer {partner_key}",
                     "X-API-Key": partner_key,
+                    "Authorization": f"Bearer {partner_key}",
                     "Idempotency-Key": transfer.idempotency_key or transfer.id,
                 }
                 try:
                     payload = json.loads(transfer.payload)
+                    # Refresh payload with backward compatible partner fields if device is present
+                    if device:
+                        dev_obj = payload.get("device", {})
+                        if "purchase_year" not in dev_obj and device.year:
+                            try:
+                                dev_obj["purchase_year"] = int(device.year)
+                            except (ValueError, TypeError):
+                                dev_obj["purchase_year"] = None
+                        if "weight_kg" not in dev_obj and device.weight:
+                            try:
+                                dev_obj["weight_kg"] = float(device.weight)
+                            except (ValueError, TypeError):
+                                dev_obj["weight_kg"] = None
+                        if "power_status" not in dev_obj:
+                            dev_obj["power_status"] = device.power or dev_obj.get("power", "")
+                        if "screen_condition" not in dev_obj:
+                            dev_obj["screen_condition"] = device.screen or dev_obj.get("screen", "")
+                        if "battery_condition" not in dev_obj:
+                            dev_obj["battery_condition"] = device.battery or dev_obj.get("battery", "")
+                        if "damage_description" not in dev_obj:
+                            dev_obj["damage_description"] = device.damage or dev_obj.get("damage", "")
+                        payload["device"] = dev_obj
+                        payload["device_id"] = payload.get("device_id") or device.id
+                        payload["transfer_id"] = payload.get("transfer_id") or transfer.id
+
                     resp = requests.post(
                         target_endpoint, json=payload, headers=headers, timeout=10
                     )
                     transfer.http_status = f"{resp.status_code} {resp.reason}"
-                    transfer.response_body = resp.text[:1000]
+                    transfer.response_body = resp.text[:2000]
                     transfer.retry_count = (transfer.retry_count or 0) + 1
                     transfer.timestamp = datetime.now(timezone.utc)
                     if resp.status_code in (200, 201):
                         transfer.status = "Completed"
-                        if device:
+                        if device and device.status == "Pending assessment":
                             device.transition_to("Processing")
                         flash("Transfer retry succeeded.")
                     elif resp.status_code == 202:
                         transfer.status = "Processing"
-                        if device:
+                        if device and device.status == "Pending assessment":
                             device.transition_to("Processing")
                         flash("Transfer retry accepted by partner.")
+                    elif resp.status_code == 409:
+                        transfer.status = "Failed"
+                        flash("Partner reported conflict (409) on retry.")
                     else:
                         transfer.status = "Failed"
                         flash(f"Transfer retry failed with status {resp.status_code}.")
+                except requests.Timeout as e:
+                    transfer.http_status = "504 Gateway Timeout"
+                    transfer.response_body = f"Retry network timeout: {str(e)}"
+                    transfer.status = "Failed"
+                    transfer.retry_count = (transfer.retry_count or 0) + 1
+                    transfer.timestamp = datetime.now(timezone.utc)
+                    flash("Retry failed due to network timeout.")
                 except requests.RequestException as e:
                     transfer.http_status = "503 Service Unavailable"
                     transfer.response_body = f"Retry connection error: {str(e)}"

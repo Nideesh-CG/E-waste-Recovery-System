@@ -1,5 +1,7 @@
 """SQLAlchemy models for Circular E-Waste Recovery Platform."""
 
+import json
+import math
 from datetime import datetime, timezone
 from flask_sqlalchemy import SQLAlchemy
 
@@ -152,6 +154,68 @@ class Device(db.Model):
             "image": self.image,
             "document": self.document,
             "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+    def to_partner_payload(self, transfer_id: str) -> dict:
+        """Construct canonical backward-compatible partner payload conforming to API_CONTRACT.md."""
+        purchase_year = None
+        if self.year:
+            try:
+                purchase_year = int(self.year)
+            except (ValueError, TypeError):
+                pass
+
+        weight_kg = None
+        if self.weight:
+            try:
+                w = float(self.weight)
+                if math.isfinite(w):
+                    weight_kg = w
+            except (ValueError, TypeError):
+                pass
+
+        files_payload = []
+        if self.files:
+            for f in self.files:
+                file_url = f"/uploads/{f.storage_key}" if not f.is_private else f"/api/v1/files/{f.storage_key}"
+                files_payload.append({
+                    "file_type": f.file_type,
+                    "original_filename": f.original_filename,
+                    "storage_key": f.storage_key,
+                    "content_type": f.content_type,
+                    "file_size": f.file_size,
+                    "url": file_url,
+                })
+
+        return {
+            "schema_version": "1.0.0",
+            "device_id": self.id,
+            "transfer_id": transfer_id,
+            "device": {
+                # Partner required fields
+                "id": self.id,
+                "name": self.name,
+                "type": self.type,
+                "brand": self.brand,
+                "model": self.model,
+                "purchase_year": purchase_year,
+                "weight_kg": weight_kg,
+                "condition": self.condition,
+                "power_status": self.power or "",
+                "screen_condition": self.screen or "",
+                "battery_condition": self.battery or "",
+                "damage_description": self.damage or "",
+                # Backward-compatible original fields
+                "year": str(self.year) if self.year is not None else "",
+                "weight": str(self.weight) if self.weight is not None else "",
+                "damage": self.damage or "",
+                "power": self.power or "",
+                "screen": self.screen or "",
+                "battery": self.battery or "",
+                "registered_date": self.date or (self.created_at.strftime("%b %d, %Y") if self.created_at else ""),
+            },
+            "files": files_payload,
+            "dispatched_at": datetime.now(timezone.utc).isoformat(),
         }
 
 
@@ -321,6 +385,12 @@ class AssessmentResult(db.Model):
         setattr(self, key, value)
 
     def to_dict(self):
+        factors_val = self.factors
+        if factors_val and isinstance(factors_val, str):
+            try:
+                factors_val = json.loads(factors_val)
+            except Exception:
+                pass
         return {
             "id": self.id,
             "device_id": self.device_id,
@@ -332,7 +402,7 @@ class AssessmentResult(db.Model):
             "co2_avoided_kg": self.co2_avoided_kg,
             "assessed_by": self.assessed_by,
             "notes": self.notes,
-            "factors": self.factors,
+            "factors": factors_val,
             "assessed_at": self.assessed_at.isoformat() if self.assessed_at else None,
         }
 

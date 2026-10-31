@@ -7,6 +7,8 @@ import json
 import math
 import secrets
 from datetime import datetime, timezone
+from typing import Optional, Tuple
+import requests
 from flask import Blueprint, current_app, jsonify, request, send_file, session
 from models import AssessmentResult, Device, DeviceFile, Transfer, db
 from storage import get_storage_service
@@ -18,26 +20,32 @@ CANONICAL_RECOMMENDATIONS = {
     "PARTS_RECOVERY",
     "RECYCLE",
     "SAFE_DISPOSAL",
+    "REJECT",
 }
 
 RECOMMENDATION_ALIASES = {
+    "REFURBISH": "REFURBISH",
+    "PARTS_RECOVERY": "PARTS_RECOVERY",
     "PARTS RECOVERY": "PARTS_RECOVERY",
     "PARTS": "PARTS_RECOVERY",
+    "RECYCLE": "RECYCLE",
+    "SAFE_DISPOSAL": "SAFE_DISPOSAL",
     "SAFE DISPOSAL": "SAFE_DISPOSAL",
     "DISPOSAL": "SAFE_DISPOSAL",
+    "REJECT": "REJECT",
 }
 
 
 def verify_api_key() -> bool:
-    """Verify inbound API key against configuration."""
+    """Verify inbound API key against configuration.
+    
+    Strictly checks headers only; credentials from query parameters are prohibited.
+    """
     expected_key = current_app.config.get("CIRCULAR_API_KEY")
     is_prod = current_app.config.get("IS_PRODUCTION", False)
 
-    # In production, missing CIRCULAR_API_KEY must fail securely
+    # In production or development, missing expected_key must fail
     if not expected_key:
-        if is_prod:
-            return False
-        # Development mode without key: allow only if explicitly configured
         return False
 
     auth_header = request.headers.get("Authorization", "")
@@ -49,7 +57,11 @@ def verify_api_key() -> bool:
     elif auth_header.startswith("Bearer "):
         provided_key = auth_header.split("Bearer ", 1)[1].strip()
 
-    return bool(provided_key and secrets.compare_digest(provided_key, expected_key))
+    # Reject query parameter credentials and empty keys
+    if not provided_key:
+        return False
+
+    return bool(secrets.compare_digest(provided_key, expected_key))
 
 
 @api_bp.before_request
@@ -127,6 +139,129 @@ def get_device(device_id):
     return jsonify(data), 200
 
 
+def dispatch_device_to_partner(device: Device, transfer_id: Optional[str] = None) -> Tuple[Transfer, bool, str]:
+    """Dispatch registered device metadata to partner Refurbishment Intelligence service.
+
+    Returns:
+        (transfer_record, is_success, message)
+    """
+    if not transfer_id:
+        transfer_id = f"TRF-{secrets.token_hex(4).upper()}"
+
+    payload = device.to_partner_payload(transfer_id)
+    partner_url = (current_app.config.get("PARTNER_API_URL") or "").rstrip("/")
+    partner_key = current_app.config.get("PARTNER_API_KEY") or ""
+    now = datetime.now(timezone.utc)
+    file_name = f"{device.id}.json"
+
+    if partner_url:
+        target_endpoint = f"{partner_url}/api/v1/refurbishment/devices"
+        if not partner_key:
+            http_status = "401 Unauthorized"
+            response_body = "Missing PARTNER_API_KEY for configured PARTNER_API_URL. Transfer aborted."
+            transfer_status = "Failed"
+            success = False
+            message = "Partner transfer failed: PARTNER_API_KEY is not configured."
+        else:
+            headers = {
+                "Content-Type": "application/json",
+                "X-API-Key": partner_key,
+                "Authorization": f"Bearer {partner_key}",
+                "Idempotency-Key": transfer_id,
+            }
+            try:
+                resp = requests.post(
+                    target_endpoint, json=payload, headers=headers, timeout=10
+                )
+                http_status = f"{resp.status_code} {resp.reason}"
+                response_body = resp.text[:2000]
+
+                if resp.status_code in (200, 201):
+                    transfer_status = "Completed"
+                    device.transition_to("Processing")
+                    success = True
+                    message = "Transfer successfully dispatched to partner application."
+                elif resp.status_code == 202:
+                    transfer_status = "Processing"
+                    device.transition_to("Processing")
+                    success = True
+                    message = "Transfer accepted by partner. Assessment in progress."
+                elif resp.status_code == 409:
+                    transfer_status = "Failed"
+                    success = False
+                    message = "Partner reported duplicate transfer conflict (409)."
+                else:
+                    transfer_status = "Failed"
+                    success = False
+                    message = f"Partner transfer failed with status {resp.status_code}."
+            except requests.Timeout as e:
+                http_status = "504 Gateway Timeout"
+                response_body = f"Network timeout contacting partner: {str(e)}"
+                transfer_status = "Failed"
+                success = False
+                message = "Network timeout contacting partner. Transfer recorded as Failed."
+            except requests.RequestException as e:
+                http_status = "503 Service Unavailable"
+                response_body = f"Connection error: {str(e)}"
+                transfer_status = "Failed"
+                success = False
+                message = "Network error contacting partner. Transfer recorded as Failed."
+    else:
+        target_endpoint = "POST /api/v1/refurbishment/devices"
+        http_status = "Not sent — awaiting dispatch"
+        response_body = "Demo transfer queued. No external API is connected."
+        transfer_status = "Pending"
+        success = False
+        message = "Demo transfer queued. No external API is connected."
+
+    transfer = Transfer(
+        id=transfer_id,
+        device_id=device.id,
+        file=file_name,
+        sender="Collection",
+        receiver="Refurbishment",
+        status=transfer_status,
+        time=f"Today, {now.strftime('%I:%M %p')}",
+        timestamp=now,
+        http_status=http_status,
+        response_body=response_body,
+        endpoint=target_endpoint,
+        payload=json.dumps(payload),
+        idempotency_key=transfer_id,
+    )
+    db.session.add(transfer)
+    db.session.commit()
+    return transfer, success, message
+
+
+@api_bp.post("/v1/devices/<device_id>/send")
+def api_send_device(device_id):
+    """Dispatch device to partner Refurbishment Intelligence service via REST API."""
+    device = Device.query.filter_by(id=device_id).first()
+    if not device:
+        return jsonify({"error": "Not Found", "message": f"Device {device_id} not found"}), 404
+
+    if device.status in ("Processing", "Refurbishment", "Parts recovery", "Completed"):
+        return jsonify({
+            "error": "Conflict",
+            "message": f"Device {device_id} is in status '{device.status}' and cannot be dispatched."
+        }), 409
+
+    transfer, success, message = dispatch_device_to_partner(device)
+    http_code = 200 if success else (
+        504 if "timeout" in (transfer.http_status or "").lower()
+        else (401 if "401" in (transfer.http_status or "")
+        else (202 if transfer.status == "Pending"
+        else 502))
+    )
+    return jsonify({
+        "status": "success" if success else "failed",
+        "message": message,
+        "transfer": transfer.to_dict(),
+        "device_status": device.status
+    }), http_code
+
+
 @api_bp.get("/v1/transfers")
 def list_transfers():
     """List all transfers with optional status filter."""
@@ -199,6 +334,8 @@ def receive_assessment():
     # 3. Numeric range and format validation with math.isfinite()
     try:
         if "repairability_score" in data and data["repairability_score"] is not None:
+            if isinstance(data["repairability_score"], bool):
+                return jsonify({"error": "Validation Error", "message": "repairability_score must be an integer between 0 and 100"}), 400
             r_val = float(data["repairability_score"])
             if not math.isfinite(r_val) or r_val != int(r_val) or not (0 <= r_val <= 100):
                 return jsonify({"error": "Validation Error", "message": "repairability_score must be an integer between 0 and 100"}), 400
@@ -207,6 +344,8 @@ def receive_assessment():
             repairability = None
 
         if "circular_recovery_score" in data and data["circular_recovery_score"] is not None:
+            if isinstance(data["circular_recovery_score"], bool):
+                return jsonify({"error": "Validation Error", "message": "circular_recovery_score must be an integer between 0 and 100"}), 400
             c_val = float(data["circular_recovery_score"])
             if not math.isfinite(c_val) or c_val != int(c_val) or not (0 <= c_val <= 100):
                 return jsonify({"error": "Validation Error", "message": "circular_recovery_score must be an integer between 0 and 100"}), 400
@@ -215,6 +354,8 @@ def receive_assessment():
             recovery_score = None
 
         if "repair_cost" in data and data["repair_cost"] is not None:
+            if isinstance(data["repair_cost"], bool):
+                return jsonify({"error": "Validation Error", "message": "repair_cost must be finite and >= 0"}), 400
             repair_cost = float(data["repair_cost"])
             if not math.isfinite(repair_cost) or repair_cost < 0:
                 return jsonify({"error": "Validation Error", "message": "repair_cost must be finite and >= 0"}), 400
@@ -224,6 +365,8 @@ def receive_assessment():
         # Accept component_value or component_recovery_value
         comp_val_raw = data.get("component_value") if "component_value" in data else data.get("component_recovery_value")
         if comp_val_raw is not None:
+            if isinstance(comp_val_raw, bool):
+                return jsonify({"error": "Validation Error", "message": "component_value must be finite and >= 0"}), 400
             component_val = float(comp_val_raw)
             if not math.isfinite(component_val) or component_val < 0:
                 return jsonify({"error": "Validation Error", "message": "component_value must be finite and >= 0"}), 400
@@ -231,6 +374,8 @@ def receive_assessment():
             component_val = None
 
         if "co2_avoided_kg" in data and data["co2_avoided_kg"] is not None:
+            if isinstance(data["co2_avoided_kg"], bool):
+                return jsonify({"error": "Validation Error", "message": "co2_avoided_kg must be finite and >= 0"}), 400
             co2_avoided = float(data["co2_avoided_kg"])
             if not math.isfinite(co2_avoided) or co2_avoided < 0:
                 return jsonify({"error": "Validation Error", "message": "co2_avoided_kg must be finite and >= 0"}), 400
@@ -255,15 +400,18 @@ def receive_assessment():
         }), 400
 
     # 5. Recommendation validation & canonical mapping
-    raw_rec = str(data["recommendation"]).strip().upper()
-    if raw_rec in CANONICAL_RECOMMENDATIONS:
-        canonical_rec = raw_rec
-    elif raw_rec in RECOMMENDATION_ALIASES:
-        canonical_rec = RECOMMENDATION_ALIASES[raw_rec]
+    raw_rec = str(data["recommendation"]).strip()
+    rec_clean = raw_rec.upper().replace("-", "_")
+    if rec_clean in RECOMMENDATION_ALIASES:
+        canonical_rec = RECOMMENDATION_ALIASES[rec_clean]
+    elif rec_clean.replace(" ", "_") in RECOMMENDATION_ALIASES:
+        canonical_rec = RECOMMENDATION_ALIASES[rec_clean.replace(" ", "_")]
+    elif rec_clean in CANONICAL_RECOMMENDATIONS:
+        canonical_rec = rec_clean
     else:
         return jsonify({
             "error": "Validation Error",
-            "message": f"Unsupported recommendation '{raw_rec}'. Must be one of: {', '.join(sorted(CANONICAL_RECOMMENDATIONS))}"
+            "message": f"Unsupported recommendation '{raw_rec}'. Must be one of: PARTS_RECOVERY, RECYCLE, REFURBISH, REJECT, SAFE_DISPOSAL"
         }), 400
 
     # 6. String length limits
@@ -283,14 +431,24 @@ def receive_assessment():
         new_status = "Refurbishment"
     elif canonical_rec == "PARTS_RECOVERY":
         new_status = "Parts recovery"
-    else:
+    elif canonical_rec in ("RECYCLE", "SAFE_DISPOSAL"):
+        new_status = "Completed"
+    elif canonical_rec == "REJECT":
+        # Explicit business mapping: REJECT signifies the device cannot be refurbished or harvested.
+        # Recommendation is recorded as 'REJECT' and device transitions to 'Completed' (triage conclusion).
         new_status = "Completed"
 
-    # Verify lifecycle transition
-    if not device.can_transition_to(new_status):
+    # Verify lifecycle prerequisites: device MUST be in 'Processing'
+    if device.status != "Processing":
         return jsonify({
             "error": "Conflict",
             "message": f"Device {device_id} is in status '{device.status}' and cannot transition to '{new_status}'. Device must be in 'Processing' before assessment can be applied."
+        }), 409
+
+    if not device.can_transition_to(new_status):
+        return jsonify({
+            "error": "Conflict",
+            "message": f"Device {device_id} is in status '{device.status}' and cannot transition to '{new_status}'."
         }), 409
 
     # Transactional execution

@@ -10,11 +10,12 @@ This document provides the authoritative REST API specification governing data e
    - All inter-application requests must supply a pre-shared API secret key via either:
      - Header: `X-API-Key: <SECRET_KEY>`
      - Header: `Authorization: Bearer <SECRET_KEY>`
+   - Credentials in URL query parameters (`?api_key=...`, `?token=...`) are strictly prohibited and rejected with HTTP 401.
 2. **Web Administrative Interface**:
    - The web user interface is intended for internal administrative and operational use.
    - CSRF tokens (`csrf`) protect browser session forms and **must never** be accepted or treated as API authentication credentials.
 3. **Network Transport**:
-   - Production deployments must strictly enforce HTTPS (TLS 1.2+).
+   - Production deployments must strictly enforce HTTPS (TLS 1.2+). Unencrypted HTTP requests in production are rejected with HTTP 403 (for API) or redirected with HTTP 301.
 4. **Idempotency Guarantees**:
    - State-changing `POST` requests must transmit a unique `Idempotency-Key: <UUID>` header (or payload `idempotency_key` / `event_id`).
    - Duplicate transmissions return the previously persisted result with HTTP 200 without duplicate state modification.
@@ -24,7 +25,7 @@ This document provides the authoritative REST API specification governing data e
 ## 2. Direction: Collection → Refurbishment
 
 ### Endpoint
-`POST /api/v1/refurbishment/devices`
+`POST {PARTNER_API_URL}/api/v1/refurbishment/devices`
 
 Dispatches registered e-waste device metadata and associated file reference keys from Collection to Refurbishment for technical evaluation and circular triage.
 
@@ -32,22 +33,31 @@ Dispatches registered e-waste device metadata and associated file reference keys
 | Header | Type | Required | Description |
 |---|---|---|---|
 | `Content-Type` | String | Yes | Must be `application/json` |
-| `X-API-Key` | String | Conditional | API key configured for outbound partner calls |
-| `Authorization` | String | Conditional | `Bearer <PARTNER_API_KEY>` (alternative to `X-API-Key`) |
-| `Idempotency-Key` | String | Yes | Transfer transaction UUID (e.g. `TRF-8F12A09B`) |
+| `X-API-Key` | String | Yes | Partner API key configured in `PARTNER_API_KEY` |
+| `Authorization` | String | Yes | `Bearer <PARTNER_API_KEY>` (sent alongside `X-API-Key`) |
+| `Idempotency-Key` | String | Yes | Unique transfer transaction UUID (e.g. `TRF-8F12A09B`) |
 
 #### Request Payload Schema
 ```json
 {
+  "schema_version": "1.0.0",
+  "device_id": "EW-2026-9B41D82A",
+  "transfer_id": "TRF-8F12A09B",
   "device": {
     "id": "EW-2026-9B41D82A",
     "name": "ThinkPad T480s",
     "type": "Laptop",
     "brand": "Lenovo",
     "model": "T480s",
+    "purchase_year": 2021,
+    "weight_kg": 1.35,
+    "condition": "Good",
+    "power_status": "Powers on",
+    "screen_condition": "Working",
+    "battery_condition": "Good",
+    "damage_description": "Minor scuff marks",
     "year": "2021",
     "weight": "1.35",
-    "condition": "Good",
     "damage": "Minor scuff marks",
     "power": "Powers on",
     "screen": "Working",
@@ -76,7 +86,7 @@ Dispatches registered e-waste device metadata and associated file reference keys
 }
 ```
 
-*Note: Filesystem paths (`file_path`, drive roots, or local directories) are never exposed.*
+*Note: Filesystem paths (`file_path`, drive roots, or local directories) are never exposed. Documents are accessed through authenticated endpoints requiring `CIRCULAR_API_KEY`.*
 
 #### Expected Partner Response Statuses
 | Status Code | Reason | Meaning / Collection Behavior |
@@ -86,11 +96,13 @@ Dispatches registered e-waste device metadata and associated file reference keys
 | **202 Accepted** | Asynchronous Processing Started | Transfer marked `Processing`. Device status transitions to `Processing`. Assessment awaited via webhook. |
 | **400 Bad Request** | Validation Failure | Transfer marked `Failed`. Device remains in `Pending assessment`. |
 | **401 Unauthorized** | Invalid Partner Key | Transfer marked `Failed`. Device remains in `Pending assessment`. |
+| **403 Forbidden** | Forbidden / Access Denied | Transfer marked `Failed`. Device remains in `Pending assessment`. |
 | **404 Not Found** | Partner Route Missing | Transfer marked `Failed`. Device remains in `Pending assessment`. |
-| **409 Conflict** | Duplicate Transfer Key | Handled per partner idempotency rules. |
+| **409 Conflict** | Duplicate Transfer Key | Handled per partner idempotency rules. Transfer marked `Failed`, device status preserved. |
 | **422 Unprocessable** | Malformed Entity | Transfer marked `Failed`. Device remains in `Pending assessment`. |
-| **500 Internal Error** | Partner System Crash | Transfer marked `Failed`. Device remains in `Pending assessment`. Retryable up to 5 attempts. |
-| **503 Service Unavailable** | Partner Maintenance / Down | Transfer marked `Failed`. Device remains in `Pending assessment`. Retryable up to 5 attempts. |
+| **500 Internal Error** | Partner System Crash | Transfer marked `Failed`. Device remains in `Pending assessment`. Retryable up to 5 attempts using original idempotency key. |
+| **503 Service Unavailable** | Partner Maintenance / Down | Transfer marked `Failed`. Device remains in `Pending assessment`. Retryable up to 5 attempts using original idempotency key. |
+| **Timeout (Network)** | Gateway Timeout / Socket Timeout | Transfer marked `Failed` with HTTP status `504 Gateway Timeout`. Device remains in `Pending assessment`. Safe retry allowed with original idempotency key. |
 
 ---
 
@@ -135,21 +147,27 @@ Transmits completed assessment metrics, repairability grading, financial yield v
 
 #### Field Specifications & Canonical Enums
 * `device_id` (String, required): Existing device identifier in Collection database.
-* `repairability_score` (Integer, required): Range `0` to `100`. Must be finite integer.
-* `circular_recovery_score` (Integer, required): Range `0` to `100`. Must be finite integer.
+* `repairability_score` (Integer, required): Range `0` to `100`. Must be finite integer (booleans rejected).
+* `circular_recovery_score` (Integer, required): Range `0` to `100`. Must be finite integer (booleans rejected).
 * `repair_cost` (Float, required): Finite number `>= 0.0`. Currency in INR (₹).
 * `component_value` (Float, required): Finite number `>= 0.0`. Alias: `component_recovery_value`.
 * `co2_avoided_kg` (Float, required): Finite number `>= 0.0`. Estimated GHG avoidance in kg.
-* `recommendation` (String, required): Canonical values:
-  - `REFURBISH` → Transitions device to `Refurbishment`.
-  - `PARTS_RECOVERY` → Transitions device to `Parts recovery`. (Aliases accepted: `PARTS RECOVERY`, `PARTS`).
-  - `RECYCLE` → Transitions device to `Completed`.
-  - `SAFE_DISPOSAL` → Transitions device to `Completed`. (Aliases accepted: `SAFE DISPOSAL`, `DISPOSAL`).
+* `assessed_by` (String, optional): Identity of the assessing organization or technician.
+* `notes` (String, optional): Assessor's qualitative technical observations.
+* `factors` (Array/String, optional): Specific technical decision factors.
+* `idempotency_key` (String, optional): Unique transaction identifier for callback deduplication.
+* `recommendation` (String, required): Canonical values (case-insensitive with normalized underscores/spaces):
+  - `REFURBISH` (Aliases: `Refurbish`) → Transitions device to `Refurbishment`.
+  - `PARTS_RECOVERY` (Aliases: `Parts Recovery`, `PARTS`) → Transitions device to `Parts recovery`.
+  - `RECYCLE` (Aliases: `Recycle`) → Transitions device to `Completed`.
+  - `SAFE_DISPOSAL` (Aliases: `Safe Disposal`, `DISPOSAL`) → Transitions device to `Completed`.
+  - `REJECT` (Aliases: `Reject`) → Explicitly recorded as `REJECT` in assessment record, transitions device to `Completed` (marking end-of-life / non-recoverable triage conclusion, distinct from RECYCLE and SAFE_DISPOSAL).
 
 #### State Machine Prerequisites
 * The device **must be in status `Processing`** when the assessment arrives.
-* If the device is in `Pending assessment`, direct transition to `Refurbishment`, `Parts recovery`, or `Completed` is **prohibited** (returns HTTP 409).
-* If the device is already in `Completed`, further transitions are **prohibited** (returns HTTP 409).
+* If the device is in `Pending assessment`, direct transition to `Refurbishment`, `Parts recovery`, or `Completed` is **prohibited** (returns HTTP 409 Conflict).
+* If the device is already in `Completed`, further transitions are **prohibited** (returns HTTP 409 Conflict).
+* Repeated callbacks with the same `Idempotency-Key` or `idempotency_key` return HTTP 200 with `"idempotent": true` and previously persisted assessment without modifying state.
 
 #### Response Schemas
 
