@@ -65,7 +65,11 @@ def run_migrations_offline():
     """
     url = config.get_main_option("sqlalchemy.url")
     context.configure(
-        url=url, target_metadata=get_metadata(), literal_binds=True
+        url=url,
+        target_metadata=get_metadata(),
+        literal_binds=True,
+        version_table_schema="collection",
+        include_schemas=True,
     )
 
     with context.begin_transaction():
@@ -90,9 +94,17 @@ def run_migrations_online():
                 directives[:] = []
                 logger.info('No changes in schema detected.')
 
+    def include_object(object, name, type_, reflected, compare_to):
+        if type_ == "table" and object.schema and object.schema != "collection":
+            return False
+        return True
+
     conf_args = current_app.extensions['migrate'].configure_args
     if conf_args.get("process_revision_directives") is None:
         conf_args["process_revision_directives"] = process_revision_directives
+    conf_args.setdefault("version_table_schema", "collection")
+    conf_args.setdefault("include_schemas", True)
+    conf_args.setdefault("include_object", include_object)
 
     connectable = get_engine()
 

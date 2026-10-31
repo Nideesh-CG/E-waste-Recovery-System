@@ -71,6 +71,25 @@ def authenticate():
     if request.path in ("/api/health", "/api/v1/notifications"):
         return None
 
+    # Immediate rejection of path traversal on files endpoint
+    if request.path.startswith("/api/v1/files/"):
+        from urllib.parse import unquote
+        subpath = request.path[len("/api/v1/files/"):]
+        decoded_subpath = unquote(subpath)
+        if (
+            ".." in subpath
+            or ".." in decoded_subpath
+            or "\\" in subpath
+            or "\\" in decoded_subpath
+        ):
+            return jsonify({"error": "Bad Request", "message": "Invalid file key"}), 400
+
+    # Allow browser session authenticated requests to view uploaded files
+    if request.path.startswith("/api/v1/files/") and (
+        session.get("authenticated") or session.get("logged_in")
+    ):
+        return None
+
     if not verify_api_key():
         return jsonify({
             "error": "Unauthorized",
@@ -148,7 +167,9 @@ def dispatch_device_to_partner(device: Device, transfer_id: Optional[str] = None
     if not transfer_id:
         transfer_id = f"TRF-{secrets.token_hex(4).upper()}"
 
-    payload = device.to_partner_payload(transfer_id)
+    storage = get_storage_service(current_app.config)
+    base_url = current_app.config.get("BACKEND_URL") or (request.host_url if request else "")
+    payload = device.to_partner_payload(transfer_id, storage_service=storage, base_url=base_url)
     partner_url = (current_app.config.get("PARTNER_API_URL") or "").rstrip("/")
     partner_key = current_app.config.get("PARTNER_API_KEY") or ""
     now = datetime.now(timezone.utc)
@@ -540,15 +561,14 @@ def get_notifications():
     }), 200
 
 
-@api_bp.get("/v1/files/<storage_key>")
+@api_bp.get("/v1/files/<path:storage_key>")
 def get_private_file(storage_key):
     """Retrieve private document or invoice with authentication."""
     # Ensure safe storage key and reject path traversal
     if (
         not storage_key
-        or not all(c.isalnum() or c in "-_." for c in storage_key)
+        or not all(c.isalnum() or c in "-_./" for c in storage_key)
         or ".." in storage_key
-        or "/" in storage_key
         or "\\" in storage_key
     ):
         return jsonify({"error": "Bad Request", "message": "Invalid file key"}), 400
@@ -558,15 +578,28 @@ def get_private_file(storage_key):
         return jsonify({"error": "Not Found", "message": "File not found"}), 404
 
     storage = get_storage_service(current_app.config)
+
+    # If short-lived signed URL is requested and supported by storage backend
+    if request.args.get("signed") == "true" and hasattr(storage, "create_signed_url"):
+        try:
+            signed_url = storage.create_signed_url(storage_key, expires_in=3600)
+            return jsonify({
+                "storage_key": storage_key,
+                "signed_url": signed_url,
+                "expires_in": 3600
+            }), 200
+        except Exception as e:
+            current_app.logger.warning("Could not generate signed URL: %s", e)
+
     try:
         file_bytes, content_type = storage.retrieve(storage_key)
         resp = send_file(
             io.BytesIO(file_bytes),
             mimetype=content_type or d_file.content_type or "application/octet-stream",
             as_attachment=False,
-            download_name=d_file.original_filename or storage_key
+            download_name=d_file.original_filename or Path(storage_key).name
         )
-        resp.headers["Content-Disposition"] = f'inline; filename="{d_file.original_filename or storage_key}"'
+        resp.headers["Content-Disposition"] = f'inline; filename="{d_file.original_filename or Path(storage_key).name}"'
         return resp
     except FileNotFoundError:
         return jsonify({"error": "Not Found", "message": "File not found"}), 404

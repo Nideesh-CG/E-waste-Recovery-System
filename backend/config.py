@@ -52,19 +52,12 @@ class Config:
 
     # Secret key for sessions and CSRF:
     # 1. Explicitly configured CIRCULAR_SECRET_KEY or SECRET_KEY in environment
-    # 2. Stable Vercel fallback: Deterministic key derived from VERCEL_GIT_COMMIT_SHA across all serverless instances
-    # 3. Local development: token_hex(32)
+    # 2. In production or Vercel, must be explicitly provided in environment (no commit sha or hardcoded fallback)
+    # 3. Local development only: token_hex(32)
     _secret = os.environ.get("CIRCULAR_SECRET_KEY") or os.environ.get("SECRET_KEY")
-    if not _secret and (IS_PRODUCTION or IS_VERCEL):
-        commit_sha = os.environ.get("VERCEL_GIT_COMMIT_SHA") or os.environ.get("VERCEL_DEPLOYMENT_ID")
-        if commit_sha:
-            import hashlib
-            _secret = hashlib.sha256(
-                f"circular-stable-session-secret-{commit_sha}".encode("utf-8")
-            ).hexdigest()
-        else:
-            _secret = "circular-default-production-session-secret-key-32b"
-    SECRET_KEY = _secret or secrets.token_hex(32)
+    if not _secret and not IS_PRODUCTION:
+        _secret = secrets.token_hex(32)
+    SECRET_KEY = _secret or ""
 
     # Session cookie security configuration for production and Vercel HTTPS
     SESSION_COOKIE_NAME = "circular_session"
@@ -85,8 +78,12 @@ class Config:
     UPLOAD_FOLDER = UPLOAD_STORAGE_PATH
     STORAGE_PROVIDER = "local"
 
-    # Database configuration supporting SQLite local and PostgreSQL on Render / Vercel
-    _raw_db_url = os.environ.get("DATABASE_URL")
+    # Database configuration supporting SQLite local and PostgreSQL on Supabase / Render
+    _raw_db_url = (
+        os.environ.get("DATABASE_URL")
+        or os.environ.get("SUPABASE_DB_URL")
+        or os.environ.get("SUPABASE_DATABASE_URL")
+    )
     if _raw_db_url:
         SQLALCHEMY_DATABASE_URI = normalize_database_url(_raw_db_url)
         if SQLALCHEMY_DATABASE_URI.startswith("sqlite:///"):
@@ -100,19 +97,33 @@ class Config:
                     db_p.parent.mkdir(parents=True, exist_ok=True)
                 except OSError:
                     pass
+    elif IS_PRODUCTION:
+        # In production, require PostgreSQL / Supabase; no SQLite or /tmp fallback
+        SQLALCHEMY_DATABASE_URI = ""
     else:
-        # Default local SQLite database (uses /tmp on Vercel serverless environment)
-        if os.environ.get("VERCEL"):
-            instance_dir = Path("/tmp")
-        else:
-            instance_dir = BASE_DIR / "instance"
-            try:
-                instance_dir.mkdir(parents=True, exist_ok=True)
-            except OSError:
-                instance_dir = Path("/tmp")
+        # Default local SQLite database (for local development only)
+        instance_dir = BASE_DIR / "instance"
+        try:
+            instance_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            instance_dir = BASE_DIR
         SQLALCHEMY_DATABASE_URI = f"sqlite:///{instance_dir / 'circular.sqlite3'}"
 
     SQLALCHEMY_TRACK_MODIFICATIONS = False
+
+    # Supabase Configuration
+    SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+    SUPABASE_SERVICE_ROLE_KEY = (
+        os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+        or os.environ.get("SUPABASE_KEY")
+        or ""
+    )
+    SUPABASE_KEY = SUPABASE_SERVICE_ROLE_KEY
+    SUPABASE_STORAGE_BUCKET = os.environ.get("SUPABASE_STORAGE_BUCKET", "ewaste-files").strip() or "ewaste-files"
+    STORAGE_PROVIDER = os.environ.get(
+        "STORAGE_PROVIDER",
+        "supabase" if IS_PRODUCTION else ("supabase" if (SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY) else "local")
+    ).lower()
 
     # Vercel internal service bindings (multi-service routing & communication)
     BACKEND_URL = os.environ.get("BACKEND_URL", "").rstrip("/")
@@ -127,12 +138,10 @@ class Config:
     PARTNER_API_KEY = os.environ.get("PARTNER_API_KEY", "")
 
     # Inbound API authentication key (used by partners calling our endpoints)
-    _default_api_key = (
-        f"circular-api-{os.environ.get('VERCEL_GIT_COMMIT_SHA', 'fallback')[:16]}"
-        if IS_PRODUCTION or IS_VERCEL
-        else "dev-circular-key"
+    CIRCULAR_API_KEY = (
+        os.environ.get("CIRCULAR_API_KEY")
+        or ("dev-circular-key" if not IS_PRODUCTION else "")
     )
-    CIRCULAR_API_KEY = os.environ.get("CIRCULAR_API_KEY") or _default_api_key
 
     # Demo data policy: in production default to False unless explicitly enabled
     SEED_DEMO_DATA = os.environ.get(
@@ -166,8 +175,11 @@ class Config:
                 else getattr(target, "CIRCULAR_SECRET_KEY", None)
             )
             effective_secret = circular_secret or secret
-            if not effective_secret or effective_secret == "dev-secret-key-replace-in-production":
-                raise ValueError("CIRCULAR_SECRET_KEY must be configured in production.")
+            if not effective_secret or effective_secret in (
+                "dev-secret-key-replace-in-production",
+                "circular-default-production-session-secret-key-32b",
+            ):
+                raise ValueError("SECRET_KEY (or CIRCULAR_SECRET_KEY) must be explicitly configured in production.")
             circular_key = (
                 target.get("CIRCULAR_API_KEY")
                 if hasattr(target, "get")
@@ -175,6 +187,66 @@ class Config:
             )
             if not circular_key:
                 raise ValueError("CIRCULAR_API_KEY must be configured in production.")
+
+            partner_key = (
+                target.get("PARTNER_API_KEY")
+                if hasattr(target, "get")
+                else getattr(target, "PARTNER_API_KEY", None)
+            )
+            if not partner_key:
+                raise ValueError("PARTNER_API_KEY must be configured in production.")
+
+            if circular_key == partner_key:
+                raise ValueError("CIRCULAR_API_KEY and PARTNER_API_KEY must be distinct credentials.")
+
+            storage_prov = (
+                target.get("STORAGE_PROVIDER")
+                if hasattr(target, "get")
+                else getattr(target, "STORAGE_PROVIDER", "")
+            )
+            sub_url = (
+                target.get("SUPABASE_URL")
+                if hasattr(target, "get")
+                else getattr(target, "SUPABASE_URL", "")
+            )
+            sub_key = (
+                target.get("SUPABASE_SERVICE_ROLE_KEY")
+                if hasattr(target, "get")
+                else getattr(target, "SUPABASE_SERVICE_ROLE_KEY", "")
+            ) or (
+                target.get("SUPABASE_KEY")
+                if hasattr(target, "get")
+                else getattr(target, "SUPABASE_KEY", "")
+            )
+            testing = (
+                target.get("TESTING", False)
+                if hasattr(target, "get")
+                else getattr(target, "TESTING", False)
+            )
+            if not testing:
+                if str(storage_prov).lower() != "supabase" or not sub_url or not sub_key:
+                    raise ValueError(
+                        "In production, STORAGE_PROVIDER must be 'supabase' and SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be configured. Local filesystem storage fallback is disallowed."
+                    )
+
+            db_uri = (
+                target.get("SQLALCHEMY_DATABASE_URI")
+                if hasattr(target, "get")
+                else getattr(target, "SQLALCHEMY_DATABASE_URI", None)
+            )
+            testing = (
+                target.get("TESTING", False)
+                if hasattr(target, "get")
+                else getattr(target, "TESTING", False)
+            )
+            testing_db = (
+                target.get("TESTING_DATABASE", False)
+                if hasattr(target, "get")
+                else getattr(target, "TESTING_DATABASE", False)
+            )
+            if not testing and not testing_db and db_uri is not None:
+                if not db_uri or (str(db_uri).startswith("sqlite") and ":memory:" not in str(db_uri)):
+                    raise ValueError("PostgreSQL DATABASE_URL (Supabase) must be configured in production. SQLite is not allowed in production.")
 
 
 class TestConfig(Config):

@@ -252,6 +252,7 @@ class CircularTests(unittest.TestCase):
         """Verify partner posting assessment results updates device status and records transfer."""
         # Per Phase 11: device must be in Processing before receiving partner assessment
         with self.app.app_context():
+            from models import Device, DeviceFile, db
             dev = Device.query.filter_by(id="EW-2024-00128").first()
             dev.status = "Processing"
             db.session.commit()
@@ -282,6 +283,7 @@ class CircularTests(unittest.TestCase):
         self.assertEqual(body["new_device_status"], "Refurbishment")
 
         with self.app.app_context():
+            from models import Device, DeviceFile, db
             dev = Device.query.filter_by(id="EW-2024-00128").first()
             self.assertEqual(dev.status, "Refurbishment")
             self.assertIsNotNone(dev.assessment)
@@ -520,6 +522,7 @@ class CircularTests(unittest.TestCase):
 
         # Partner rejection (HTTP 400) on pending device
         with self.app.app_context():
+            from models import Device, DeviceFile, db
             dev = Device.query.filter_by(id="EW-2024-00128").first()
             dev.status = "Pending assessment"
             db.session.commit()
@@ -791,6 +794,7 @@ class CircularTests(unittest.TestCase):
         self.app.config["PARTNER_API_URL"] = "https://partner.example.com"
         self.app.config["PARTNER_API_KEY"] = ""
         with self.app.app_context():
+            from models import Device, DeviceFile, db
             dev = Device.query.filter_by(id="EW-2024-00128").first()
             dev.status = "Pending assessment"
             db.session.commit()
@@ -798,6 +802,7 @@ class CircularTests(unittest.TestCase):
         res = self.client.post("/devices/EW-2024-00128/send", data={"csrf": self.token()}, follow_redirects=True)
         self.assertEqual(res.status_code, 200)
         with self.app.app_context():
+            from models import Device, DeviceFile, db
             dev = Device.query.filter_by(id="EW-2024-00128").first()
             # Device must NOT move to Processing
             self.assertEqual(dev.status, "Pending assessment")
@@ -1316,6 +1321,10 @@ class CircularTests(unittest.TestCase):
             IS_PRODUCTION = True
             SECRET_KEY = "valid-prod-secret-key-12345678"
             CIRCULAR_API_KEY = "valid-prod-api-key-12345678"
+            PARTNER_API_KEY = "valid-prod-partner-key-12345678"
+            STORAGE_PROVIDER = "supabase"
+            SUPABASE_URL = "https://example.supabase.co"
+            SUPABASE_SERVICE_ROLE_KEY = "dummy-service-role-key"
             SEED_DEMO_DATA = True  # Attempt to seed in production should be blocked
             SQLALCHEMY_DATABASE_URI = f"sqlite:///{prod_db_path}"
 
@@ -1420,6 +1429,7 @@ class CircularTests(unittest.TestCase):
         - files list format with safe relative URLs and NO local filesystem paths
         """
         with self.app.app_context():
+            from models import Device, DeviceFile, db
             dev = Device.query.filter_by(id="EW-2024-00128").first()
             dev.power = "Powers on normally"
             dev.screen = "Working, no dead pixels"
@@ -1503,6 +1513,7 @@ class CircularTests(unittest.TestCase):
 
         # Verify database records
         with self.app.app_context():
+            from models import Device, DeviceFile, db
             dev = Device.query.filter_by(id="EW-2024-00128").first()
             self.assertEqual(dev.status, "Processing")
 
@@ -1541,6 +1552,7 @@ class CircularTests(unittest.TestCase):
         self.assertIn(b"Partner transfer failed with status 401", res.data)
 
         with self.app.app_context():
+            from models import Device, DeviceFile, db
             dev = Device.query.filter_by(id="EW-2024-00128").first()
             self.assertEqual(dev.status, "Pending assessment")
             trf = Transfer.query.filter_by(device_id="EW-2024-00128").order_by(Transfer.timestamp.desc()).first()
@@ -1557,6 +1569,7 @@ class CircularTests(unittest.TestCase):
         self.assertEqual(res_empty.status_code, 200)
         self.assertIn(b"PARTNER_API_KEY is not configured", res_empty.data)
         with self.app.app_context():
+            from models import Device, DeviceFile, db
             dev = Device.query.filter_by(id="EW-2024-00128").first()
             self.assertEqual(dev.status, "Pending assessment")
 
@@ -1587,6 +1600,7 @@ class CircularTests(unittest.TestCase):
         self.assertIn(b"Partner transfer failed with status 503", res.data)
 
         with self.app.app_context():
+            from models import Device, DeviceFile, db
             dev = Device.query.filter_by(id="EW-2024-00128").first()
             self.assertEqual(dev.status, "Pending assessment")
             trf = Transfer.query.filter_by(device_id="EW-2024-00128").order_by(Transfer.timestamp.desc()).first()
@@ -1618,6 +1632,7 @@ class CircularTests(unittest.TestCase):
         self.assertIn(b"Network timeout", res.data)
 
         with self.app.app_context():
+            from models import Device, DeviceFile, db
             dev = Device.query.filter_by(id="EW-2024-00128").first()
             self.assertEqual(dev.status, "Pending assessment")
             trf = Transfer.query.filter_by(device_id="EW-2024-00128").order_by(Transfer.timestamp.desc()).first()
@@ -1661,6 +1676,7 @@ class CircularTests(unittest.TestCase):
         """
         # In Processing
         with self.app.app_context():
+            from models import Device, DeviceFile, db
             dev = Device.query.filter_by(id="EW-2024-00128").first()
             dev.status = "Processing"
             db.session.commit()
@@ -1675,6 +1691,7 @@ class CircularTests(unittest.TestCase):
 
         # In Completed
         with self.app.app_context():
+            from models import Device, DeviceFile, db
             dev = Device.query.filter_by(id="EW-2024-00128").first()
             dev.status = "Completed"
             db.session.commit()
@@ -1706,6 +1723,7 @@ class CircularTests(unittest.TestCase):
         - Returns structured JSON response
         """
         with self.app.app_context():
+            from models import Device, DeviceFile, db
             dev = Device.query.filter_by(id="EW-2024-00128").first()
             dev.status = "Processing"
             AssessmentResult.query.filter_by(device_id="EW-2024-00128").delete()
@@ -1743,6 +1761,7 @@ class CircularTests(unittest.TestCase):
         self.assertEqual(data["assessment"]["component_value"], 11000.0)
 
         with self.app.app_context():
+            from models import Device, DeviceFile, db
             dev = Device.query.filter_by(id="EW-2024-00128").first()
             self.assertEqual(dev.status, "Refurbishment")
             self.assertIsNotNone(dev.assessment)
@@ -1762,6 +1781,7 @@ class CircularTests(unittest.TestCase):
         - co2_avoided_kg: < 0, NaN, Inf, boolean -> 400
         """
         with self.app.app_context():
+            from models import Device, DeviceFile, db
             dev = Device.query.filter_by(id="EW-2024-00128").first()
             dev.status = "Processing"
             db.session.commit()
@@ -1851,6 +1871,7 @@ class CircularTests(unittest.TestCase):
         bad_rec_payload = dict(base_payload)
         bad_rec_payload["recommendation"] = "DESTROY_COMPLETELY"
         with self.app.app_context():
+            from models import Device, DeviceFile, db
             dev = Device.query.filter_by(id="EW-2024-00128").first()
             dev.status = "Processing"
             db.session.commit()
@@ -1910,6 +1931,7 @@ class CircularTests(unittest.TestCase):
 
         # Device in 'Pending assessment' -> must return 409 Conflict
         with self.app.app_context():
+            from models import Device, DeviceFile, db
             dev = Device.query.filter_by(id="EW-2024-00128").first()
             dev.status = "Pending assessment"
             db.session.commit()
@@ -1920,6 +1942,7 @@ class CircularTests(unittest.TestCase):
 
         # Device in 'Completed' -> must return 409 Conflict
         with self.app.app_context():
+            from models import Device, DeviceFile, db
             dev = Device.query.filter_by(id="EW-2024-00128").first()
             dev.status = "Completed"
             db.session.commit()
@@ -1937,6 +1960,7 @@ class CircularTests(unittest.TestCase):
         - No duplicate transfers created in database
         """
         with self.app.app_context():
+            from models import Device, DeviceFile, db
             dev = Device.query.filter_by(id="EW-2024-00128").first()
             dev.status = "Processing"
             AssessmentResult.query.filter_by(device_id="EW-2024-00128").delete()
@@ -2151,7 +2175,11 @@ class CircularTests(unittest.TestCase):
             with patch.dict(os.environ, {
                 "IS_PRODUCTION": "true",
                 "CIRCULAR_SECRET_KEY": "prod-secret-12345",
-                "CIRCULAR_API_KEY": "api-key-12345"
+                "CIRCULAR_API_KEY": "api-key-12345",
+                "PARTNER_API_KEY": "partner-key-12345",
+                "STORAGE_PROVIDER": "supabase",
+                "SUPABASE_URL": "https://example.supabase.co",
+                "SUPABASE_SERVICE_ROLE_KEY": "dummy-role-key",
             }):
                 prod_app = create_app(temp_db)
                 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -2165,7 +2193,11 @@ class CircularTests(unittest.TestCase):
                 "VERCEL": "1",
                 "VERCEL_ENV": "preview",
                 "SECRET_KEY": "preview-stable-secret-key-12345",
-                "CIRCULAR_API_KEY": "preview-api-key"
+                "CIRCULAR_API_KEY": "preview-api-key",
+                "PARTNER_API_KEY": "preview-partner-key",
+                "STORAGE_PROVIDER": "supabase",
+                "SUPABASE_URL": "https://example.supabase.co",
+                "SUPABASE_SERVICE_ROLE_KEY": "dummy-role-key",
             }):
                 preview_app = create_app(temp_db)
                 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -2183,6 +2215,671 @@ class CircularTests(unittest.TestCase):
                 csrf_inp = form.find("input", {"name": "csrf"})
                 self.assertIsNotNone(csrf_inp, "POST form must contain injected csrf input")
                 self.assertTrue(len(csrf_inp.get("value", "")) >= 32)
+
+
+class Phase10IntegrationTests(unittest.TestCase):
+    """Phase 10: Mandatory Comprehensive Integration Tests for Supabase, Schemas, APIs, Storage, and Security."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.database = Path(self.directory.name) / "phase10_test.sqlite3"
+        self.app = create_app(self.database)
+        self.app.config.update(
+            TESTING=True,
+            SECRET_KEY="test-phase10-secret-key-32b",
+            CIRCULAR_API_KEY="test-circular-inbound-key",
+            PARTNER_API_KEY="test-partner-outbound-key",
+            PARTNER_API_URL="https://partner-test.example.com",
+            UPLOAD_STORAGE_PATH=str(Path(self.directory.name) / "uploads"),
+            STORAGE_PROVIDER="local",
+        )
+        self.client = self.app.test_client()
+
+    def tearDown(self):
+        with self.app.app_context():
+            db.session.remove()
+            db.engine.dispose()
+        try:
+            self.directory.cleanup()
+        except Exception:
+            pass
+
+    def token(self):
+        self.client.get("/register")
+        with self.client.session_transaction() as s:
+            return s.get("csrf")
+
+    def test_01_supabase_postgresql_connection_normalization(self):
+        """1. Supabase PostgreSQL connection & URL normalization (Transaction Pooler port 6543 / Session pooler)."""
+        from config import normalize_database_url
+        supabase_urls = [
+            ("postgres://postgres.abc:pwd@aws-0-us-east-1.pooler.supabase.com:6543/postgres",
+             "postgresql+psycopg://postgres.abc:pwd@aws-0-us-east-1.pooler.supabase.com:6543/postgres"),
+            ("postgresql://postgres.abc:pwd@aws-0-us-east-1.pooler.supabase.com:5432/postgres",
+             "postgresql+psycopg://postgres.abc:pwd@aws-0-us-east-1.pooler.supabase.com:5432/postgres"),
+            ("postgresql+psycopg2://postgres:pwd@db.supabase.co:5432/postgres",
+             "postgresql+psycopg://postgres:pwd@db.supabase.co:5432/postgres"),
+            ("postgresql+psycopg://postgres:pwd@db.supabase.co:5432/postgres",
+             "postgresql+psycopg://postgres:pwd@db.supabase.co:5432/postgres"),
+        ]
+        for raw, expected in supabase_urls:
+            self.assertEqual(normalize_database_url(raw), expected)
+
+    def test_02_collection_schema_access_and_isolation(self):
+        """2. Collection schema access and database table isolation."""
+        from models import Device, Transfer, AssessmentResult, DeviceFile, Metadata
+        for model in (Device, Transfer, AssessmentResult, DeviceFile, Metadata):
+            self.assertEqual(model.__table__.schema, "collection", f"{model.__name__} must belong to 'collection' schema")
+
+        # Verify foreign keys point into collection schema
+        fk_targets = [fk.target_fullname for fk in Transfer.__table__.foreign_keys]
+        self.assertIn("collection.devices.id", fk_targets)
+        fk_targets_asmt = [fk.target_fullname for fk in AssessmentResult.__table__.foreign_keys]
+        self.assertIn("collection.devices.id", fk_targets_asmt)
+        fk_targets_file = [fk.target_fullname for fk in DeviceFile.__table__.foreign_keys]
+        self.assertIn("collection.devices.id", fk_targets_file)
+
+    def test_03_device_registration_with_file_upload(self):
+        """3. Device registration with metadata and file upload."""
+        from models import Device, DeviceFile, db
+        token = self.token()
+        img_bytes = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x01\x00`\x00`\x00\x00" + b"\x00" * 1024
+        payload = {
+            "csrf": token,
+            "Device Type": "Laptop",
+            "Brand": "Lenovo",
+            "Model": "ThinkPad T14",
+            "Purchase Year": "2021",
+            "Condition": "Good",
+            "Power Status": "Powers on",
+            "Screen Condition": "Working",
+            "Battery Condition": "Good",
+            "Estimated Weight": "1.4",
+            "Damage Description": "Minor chassis scratch",
+            "image": (io.BytesIO(img_bytes), "thinkpad.jpg"),
+        }
+        res = self.client.post("/register", data=payload, follow_redirects=True)
+        self.assertEqual(res.status_code, 200)
+        with self.app.app_context():
+            dev = Device.query.filter_by(name="Lenovo ThinkPad T14").first()
+            self.assertIsNotNone(dev)
+            self.assertEqual(dev.status, "Pending assessment")
+            self.assertEqual(dev.brand, "Lenovo")
+            self.assertEqual(dev.weight_kg, 1.4)
+            df = DeviceFile.query.filter_by(device_id=dev.id, file_type="image").first()
+            self.assertIsNotNone(df)
+            self.assertFalse(df.is_private)
+            self.assertEqual(df.content_type, "image/jpeg")
+
+    @patch("app.requests.post")
+    def test_04_device_transfer_dispatch(self, mock_post):
+        """4. Device transfer outbound dispatch to partner API."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"status": "success", "message": "Device received by refurbishment"}
+        mock_resp.text = '{"status": "success"}'
+        mock_post.return_value = mock_resp
+
+        with self.app.app_context():
+            dev = Device(
+                id="EW-2024-TEST01",
+                name="Dell XPS 13",
+                type="Laptop",
+                brand="Dell",
+                model="XPS 13",
+                year="2022",
+                weight="1.2",
+                condition="Good",
+                power="Powers on",
+                screen="Working",
+                battery="Good",
+                damage="None",
+                status="Pending assessment",
+            )
+            db.session.add(dev)
+            db.session.commit()
+
+        csrf = self.token()
+        res = self.client.post("/devices/EW-2024-TEST01/send", data={"csrf": csrf}, follow_redirects=True)
+        self.assertEqual(res.status_code, 200)
+
+        # Verify outbound call
+        self.assertTrue(mock_post.called)
+        call_url = mock_post.call_args[0][0]
+        self.assertEqual(call_url, "https://partner-test.example.com/api/v1/refurbishment/devices")
+        call_headers = mock_post.call_args[1].get("headers", {})
+        self.assertEqual(call_headers.get("X-API-Key"), "test-partner-outbound-key")
+        self.assertEqual(call_headers.get("Authorization"), "Bearer test-partner-outbound-key")
+        self.assertIn("Idempotency-Key", call_headers)
+
+        call_json = mock_post.call_args[1].get("json", {})
+        self.assertEqual(call_json.get("device_id"), "EW-2024-TEST01")
+        self.assertIn("transfer_id", call_json)
+        self.assertEqual(call_json.get("device", {}).get("brand"), "Dell")
+
+        with self.app.app_context():
+            updated_dev = Device.query.filter_by(id="EW-2024-TEST01").first()
+            self.assertEqual(updated_dev.status, "Processing")
+
+    @patch("app.requests.post")
+    def test_05_invalid_partner_credential(self, mock_post):
+        """5. Invalid partner credential handling (partner returns 401)."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 401
+        mock_resp.json.return_value = {"error": "Unauthorized", "message": "Invalid API Key"}
+        mock_resp.text = '{"error": "Unauthorized"}'
+        mock_post.return_value = mock_resp
+
+        with self.app.app_context():
+            dev = Device(
+                id="EW-2024-TEST02",
+                name="HP Pavilion",
+                type="Laptop",
+                brand="HP",
+                model="Pavilion",
+                year="2021",
+                weight="1.8",
+                condition="Good",
+                status="Pending assessment",
+            )
+            db.session.add(dev)
+            db.session.commit()
+
+        csrf = self.token()
+        res = self.client.post("/devices/EW-2024-TEST02/send", data={"csrf": csrf}, follow_redirects=True)
+        self.assertEqual(res.status_code, 200)
+
+        with self.app.app_context():
+            dev_after = Device.query.filter_by(id="EW-2024-TEST02").first()
+            self.assertEqual(dev_after.status, "Pending assessment")
+            trf = Transfer.query.filter_by(device_id="EW-2024-TEST02").first()
+            self.assertIsNotNone(trf)
+            self.assertEqual(trf.status, "Failed")
+
+    def test_06_valid_assessment_callback(self):
+        """6. Valid assessment callback with canonical recommendations."""
+        with self.app.app_context():
+            dev = Device(
+                id="EW-2024-TEST03",
+                name="Apple iPad Air",
+                type="Tablet",
+                brand="Apple",
+                model="iPad Air",
+                year="2022",
+                weight="0.5",
+                condition="Good",
+                status="Processing",
+            )
+            db.session.add(dev)
+            db.session.commit()
+
+        payload = {
+            "device_id": "EW-2024-TEST03",
+            "transfer_id": "TRF-TEST03",
+            "recommendation": "REFURBISH",
+            "repairability_score": 85.0,
+            "circular_recovery_score": 90.0,
+            "repair_cost": 1500.0,
+            "component_value": 4500.0,
+            "co2_avoided_kg": 24.5,
+            "assessed_by": "Refurbishment Team",
+            "notes": "Excellent condition for resale",
+        }
+        res = self.client.post(
+            "/api/v1/assessment-results",
+            json=payload,
+            headers={"X-API-Key": "test-circular-inbound-key"},
+        )
+        self.assertEqual(res.status_code, 200)
+        data = res.get_json()
+        self.assertEqual(data["status"], "success")
+
+        with self.app.app_context():
+            dev_after = Device.query.filter_by(id="EW-2024-TEST03").first()
+            self.assertEqual(dev_after.status, "Refurbishment")
+            asmt = AssessmentResult.query.filter_by(device_id="EW-2024-TEST03").first()
+            self.assertIsNotNone(asmt)
+            self.assertEqual(asmt.recommendation, "REFURBISH")
+            self.assertEqual(asmt.repairability_score, 85.0)
+
+    def test_07_invalid_callback_credential(self):
+        """7. Invalid callback credential rejection (missing or bad key returns 401)."""
+        payload = {"device_id": "EW-2024-TEST03", "recommendation": "REFURBISH"}
+        res1 = self.client.post("/api/v1/assessment-results", json=payload)
+        self.assertEqual(res1.status_code, 401)
+
+        res2 = self.client.post(
+            "/api/v1/assessment-results",
+            json=payload,
+            headers={"X-API-Key": "wrong-key-12345"},
+        )
+        self.assertEqual(res2.status_code, 401)
+
+    def test_08_duplicate_transfer(self):
+        """8. Duplicate transfer handling."""
+        with self.app.app_context():
+            dev = Device(
+                id="EW-2024-TEST04",
+                name="Dell OptiPlex",
+                type="Desktop",
+                brand="Dell",
+                model="OptiPlex",
+                year="2019",
+                weight="5.0",
+                condition="Good",
+                status="Processing",
+            )
+            db.session.add(dev)
+            db.session.commit()
+
+        csrf = self.token()
+        res = self.client.post("/devices/EW-2024-TEST04/send", data={"csrf": csrf}, follow_redirects=True)
+        self.assertEqual(res.status_code, 200)
+        self.assertTrue(
+            b"currently undergoing assessment" in res.data
+            or b"is not pending assessment" in res.data
+            or b"already completed" in res.data
+        )
+
+    def test_09_duplicate_assessment_callback(self):
+        """9. Duplicate assessment callback idempotency and lifecycle protection."""
+        with self.app.app_context():
+            dev = Device(
+                id="EW-2024-TEST05",
+                name="Acer Aspire",
+                type="Laptop",
+                brand="Acer",
+                model="Aspire",
+                year="2020",
+                weight="2.0",
+                condition="Fair",
+                status="Processing",
+            )
+            db.session.add(dev)
+            db.session.commit()
+
+        payload = {
+            "device_id": "EW-2024-TEST05",
+            "transfer_id": "TRF-TEST05",
+            "idempotency_key": "IDEMP-KEY-TEST-05",
+            "recommendation": "PARTS_RECOVERY",
+            "repairability_score": 45.0,
+            "circular_recovery_score": 60.0,
+            "repair_cost": 800.0,
+            "component_value": 2500.0,
+            "co2_avoided_kg": 15.0,
+        }
+        headers = {"X-API-Key": "test-circular-inbound-key"}
+        res1 = self.client.post("/api/v1/assessment-results", json=payload, headers=headers)
+        self.assertEqual(res1.status_code, 200)
+
+        res2 = self.client.post("/api/v1/assessment-results", json=payload, headers=headers)
+        self.assertEqual(res2.status_code, 200)
+        data2 = res2.get_json()
+        self.assertTrue(data2.get("idempotent"))
+
+        with self.app.app_context():
+            count = AssessmentResult.query.filter_by(device_id="EW-2024-TEST05").count()
+            self.assertEqual(count, 1)
+
+    @patch("app.requests.post")
+    def test_10_partner_api_unavailable_and_timeout(self, mock_post):
+        """10. Partner API unavailable and timeout handling."""
+        mock_post.side_effect = requests.exceptions.Timeout("Connection timed out")
+        with self.app.app_context():
+            dev = Device(
+                id="EW-2024-TEST06",
+                name="Sony Bravia",
+                type="Monitor",
+                brand="Sony",
+                model="Bravia",
+                year="2021",
+                weight="8.0",
+                condition="Good",
+                status="Pending assessment",
+            )
+            db.session.add(dev)
+            db.session.commit()
+
+        csrf = self.token()
+        res = self.client.post("/devices/EW-2024-TEST06/send", data={"csrf": csrf}, follow_redirects=True)
+        self.assertEqual(res.status_code, 200)
+
+        with self.app.app_context():
+            dev_after = Device.query.filter_by(id="EW-2024-TEST06").first()
+            self.assertEqual(dev_after.status, "Pending assessment")
+            trf = Transfer.query.filter_by(device_id="EW-2024-TEST06").first()
+            self.assertEqual(trf.status, "Failed")
+
+    def test_11_callback_failure_and_rollback(self):
+        """11. Callback failure on non-existent device and rollback."""
+        payload = {
+            "device_id": "EW-NONEXISTENT-9999",
+            "recommendation": "REFURBISH",
+        }
+        res = self.client.post(
+            "/api/v1/assessment-results",
+            json=payload,
+            headers={"X-API-Key": "test-circular-inbound-key"},
+        )
+        self.assertEqual(res.status_code, 404)
+        with self.app.app_context():
+            asmt = AssessmentResult.query.filter_by(device_id="EW-NONEXISTENT-9999").first()
+            self.assertIsNone(asmt)
+
+    def test_12_file_upload_supabase_storage_and_local(self):
+        """12. File upload to Supabase Storage structure and LocalStorage."""
+        from storage import LocalStorage, SupabaseStorage
+        local_store = LocalStorage(self.app.config["UPLOAD_STORAGE_PATH"])
+        test_bytes = b"Hello Circular World"
+        key, url = local_store.save(test_bytes, "test_doc.pdf", is_private=True, device_id="EW-1234", file_type="document")
+        self.assertTrue(key.endswith(".pdf"))
+        retrieved_bytes, ct = local_store.retrieve(key)
+        self.assertEqual(retrieved_bytes, test_bytes)
+
+        # Test SupabaseStorage class structure
+        with patch("storage.requests.Session") as mock_session_cls:
+            mock_sess = mock_session_cls.return_value
+            mock_sess.get.return_value.status_code = 200
+            mock_sess.post.return_value.status_code = 201
+
+            supa = SupabaseStorage("https://xyz.supabase.co", "test-key", bucket="collection")
+            k, u = supa.save(test_bytes, "photo.jpg", is_private=False, device_id="EW-2024-999", file_type="image")
+            self.assertTrue(k.startswith("collection/devices/EW-2024-999/images/"))
+            self.assertEqual(u, f"/api/v1/files/{k}")
+
+    def test_13_file_retrieval_and_signed_url(self):
+        """13. File retrieval endpoint, traversal protection, and signed URLs."""
+        res_trav = self.client.get("/api/v1/files/..%2Fsecret.txt")
+        self.assertIn(res_trav.status_code, (400, 404))
+
+        from models import DeviceFile
+        with self.app.app_context():
+            dev = Device(
+                id="EW-2024-TEST01",
+                name="Dell XPS 13",
+                type="Laptop",
+                brand="Dell",
+                model="XPS 13",
+                year="2022",
+                weight="1.2",
+                condition="Good",
+                status="Pending assessment",
+            )
+            db.session.add(dev)
+            df = DeviceFile(
+                device_id="EW-2024-TEST01",
+                file_type="document",
+                filename="manual.pdf",
+                original_filename="manual.pdf",
+                storage_key="manual_test_key_01.pdf",
+                file_path="/api/v1/files/manual_test_key_01.pdf",
+                content_type="application/pdf",
+                file_size=20,
+                is_private=True,
+            )
+            db.session.add(df)
+            db.session.commit()
+            target_p = Path(self.app.config["UPLOAD_STORAGE_PATH"]) / "manual_test_key_01.pdf"
+            target_p.parent.mkdir(parents=True, exist_ok=True)
+            target_p.write_bytes(b"%PDF-1.4 sample content")
+
+        res_auth = self.client.get(
+            "/api/v1/files/manual_test_key_01.pdf",
+            headers={"X-API-Key": "test-circular-inbound-key"},
+        )
+        self.assertEqual(res_auth.status_code, 200)
+
+    def test_14_dashboard_metrics(self):
+        """14. Dashboard metrics calculation from real database records."""
+        from metrics import get_platform_metrics
+        with self.app.app_context():
+            dev = Device(
+                id="EW-METRIC-01",
+                name="Metric Device",
+                type="Laptop",
+                brand="Dell",
+                model="Latitude",
+                year="2022",
+                weight="2.5",
+                condition="Good",
+                status="Pending assessment",
+            )
+            db.session.add(dev)
+            db.session.commit()
+            m = get_platform_metrics()
+            self.assertGreaterEqual(m["total_devices"], 1)
+            self.assertGreaterEqual(m["pending_count"], 1)
+
+        res = self.client.get("/")
+        self.assertEqual(res.status_code, 200)
+        self.assertIn(b"Recovery at a glance", res.data)
+
+    def test_15_csrf_registration(self):
+        """15. CSRF registration security: token generation, validation, rejection."""
+        res_get = self.client.get("/register")
+        self.assertEqual(res_get.status_code, 200)
+        html = soup(res_get.data.decode("utf-8"))
+        csrf_inp = html.find("input", {"name": "csrf"})
+        self.assertIsNotNone(csrf_inp)
+        token = csrf_inp.get("value")
+        self.assertTrue(len(token) >= 32)
+
+        payload_no_csrf = {
+            "Device Type": "Laptop",
+            "Brand": "Dell",
+            "Model": "Latitude",
+            "Purchase Year": "2022",
+            "Condition": "Good",
+            "Power Status": "Powers on",
+            "Screen Condition": "Working",
+            "Battery Condition": "Good",
+            "Estimated Weight": "1.5",
+        }
+        res_fail = self.client.post("/register", data=payload_no_csrf)
+        self.assertEqual(res_fail.status_code, 400)
+        self.assertTrue(
+            b"Security Token Expired" in res_fail.data
+            or b"Invalid form token" in res_fail.data
+            or b"security token is invalid" in res_fail.data
+        )
+
+        payload_valid = dict(payload_no_csrf)
+        payload_valid["csrf"] = token
+        res_ok = self.client.post("/register", data=payload_valid, follow_redirects=True)
+        self.assertEqual(res_ok.status_code, 200)
+        self.assertIn(b"Device registered successfully", res_ok.data)
+
+        payload_valid = dict(payload_no_csrf)
+        payload_valid["csrf"] = token
+        res_ok = self.client.post("/register", data=payload_valid, follow_redirects=True)
+        self.assertEqual(res_ok.status_code, 200)
+        self.assertIn(b"Device registered successfully", res_ok.data)
+
+    def test_16_missing_production_configuration(self):
+        """16. Missing production configuration fail-fast validation."""
+        from config import Config
+        # Missing SECRET_KEY
+        bad_config_secret = {
+            "IS_PRODUCTION": True,
+            "SECRET_KEY": "",
+            "CIRCULAR_SECRET_KEY": "",
+            "CIRCULAR_API_KEY": "valid-circular-key",
+            "PARTNER_API_KEY": "valid-partner-key",
+            "STORAGE_PROVIDER": "supabase",
+            "SUPABASE_URL": "https://xyz.supabase.co",
+            "SUPABASE_SERVICE_ROLE_KEY": "valid-role-key",
+        }
+        with self.assertRaises(ValueError) as ctx:
+            Config.validate_production_config(bad_config_secret)
+        self.assertIn("SECRET_KEY", str(ctx.exception))
+
+        # Missing CIRCULAR_API_KEY
+        bad_config_1 = {
+            "IS_PRODUCTION": True,
+            "SECRET_KEY": "valid-production-secret-key-32b",
+            "CIRCULAR_API_KEY": "",
+            "PARTNER_API_KEY": "valid-partner-key",
+            "STORAGE_PROVIDER": "supabase",
+            "SUPABASE_URL": "https://xyz.supabase.co",
+            "SUPABASE_SERVICE_ROLE_KEY": "valid-role-key",
+        }
+        with self.assertRaises(ValueError) as ctx:
+            Config.validate_production_config(bad_config_1)
+        self.assertIn("CIRCULAR_API_KEY", str(ctx.exception))
+
+        # Missing PARTNER_API_KEY
+        bad_config_partner = {
+            "IS_PRODUCTION": True,
+            "SECRET_KEY": "valid-production-secret-key-32b",
+            "CIRCULAR_API_KEY": "valid-circular-key",
+            "PARTNER_API_KEY": "",
+            "STORAGE_PROVIDER": "supabase",
+            "SUPABASE_URL": "https://xyz.supabase.co",
+            "SUPABASE_SERVICE_ROLE_KEY": "valid-role-key",
+        }
+        with self.assertRaises(ValueError) as ctx:
+            Config.validate_production_config(bad_config_partner)
+        self.assertIn("PARTNER_API_KEY", str(ctx.exception))
+
+        # Distinct keys enforced: CIRCULAR_API_KEY == PARTNER_API_KEY rejected
+        bad_config_2 = {
+            "IS_PRODUCTION": True,
+            "SECRET_KEY": "valid-production-secret-key-32b",
+            "CIRCULAR_API_KEY": "shared-same-key",
+            "PARTNER_API_KEY": "shared-same-key",
+            "STORAGE_PROVIDER": "supabase",
+            "SUPABASE_URL": "https://xyz.supabase.co",
+            "SUPABASE_SERVICE_ROLE_KEY": "valid-role-key",
+        }
+        with self.assertRaises(ValueError) as ctx:
+            Config.validate_production_config(bad_config_2)
+        self.assertIn("distinct", str(ctx.exception).lower())
+
+        # Disallow SQLite in production
+        bad_config_3 = {
+            "IS_PRODUCTION": True,
+            "SECRET_KEY": "valid-production-secret-key-32b",
+            "CIRCULAR_API_KEY": "circular-key",
+            "PARTNER_API_KEY": "partner-key",
+            "STORAGE_PROVIDER": "supabase",
+            "SUPABASE_URL": "https://xyz.supabase.co",
+            "SUPABASE_SERVICE_ROLE_KEY": "valid-role-key",
+            "SQLALCHEMY_DATABASE_URI": "sqlite:///instance/circular.sqlite3",
+            "TESTING": False,
+        }
+        with self.assertRaises(ValueError) as ctx:
+            Config.validate_production_config(bad_config_3)
+        self.assertIn("SQLite is not allowed in production", str(ctx.exception))
+
+    def test_17_no_local_storage_fallback_in_production(self):
+        """17. Production forbids local filesystem storage and requires Supabase Storage."""
+        from config import Config
+        from storage import get_storage_service
+
+        prod_cfg_local_storage = {
+            "IS_PRODUCTION": True,
+            "SECRET_KEY": "valid-production-secret-key-32b",
+            "CIRCULAR_API_KEY": "circular-key",
+            "PARTNER_API_KEY": "partner-key",
+            "STORAGE_PROVIDER": "local",
+            "TESTING": False,
+        }
+        with self.assertRaises(ValueError) as ctx:
+            Config.validate_production_config(prod_cfg_local_storage)
+        self.assertIn("STORAGE_PROVIDER must be 'supabase'", str(ctx.exception))
+
+        with self.assertRaises(ValueError) as ctx_factory:
+            get_storage_service({
+                "IS_PRODUCTION": "true",
+                "STORAGE_PROVIDER": "local",
+            })
+        self.assertIn("storage provider must be 'supabase'", str(ctx_factory.exception))
+
+    def test_18_postgresql_schema_configuration(self):
+        """18. PostgreSQL schema is strictly isolated to 'collection'."""
+        import models
+        from models import Device, Transfer, AssessmentResult, DeviceFile, Metadata
+
+        self.assertEqual(models.SCHEMA, "collection")
+        self.assertEqual(Device.__table__.schema, "collection")
+        self.assertEqual(Transfer.__table__.schema, "collection")
+        self.assertEqual(AssessmentResult.__table__.schema, "collection")
+        self.assertEqual(DeviceFile.__table__.schema, "collection")
+        self.assertEqual(Metadata.__table__.schema, "collection")
+
+    def test_19_migration_configuration_and_scripts(self):
+        """19. Migration directory and SQL init scripts verify collection schema ownership."""
+        from pathlib import Path
+        root = Path(__file__).resolve().parent.parent
+
+        sql_init = root / "migrations" / "collection_schema_init.sql"
+        self.assertTrue(sql_init.is_file())
+        sql_content = sql_init.read_text(encoding="utf-8")
+        self.assertIn("CREATE SCHEMA IF NOT EXISTS collection", sql_content)
+        self.assertIn("ALTER TABLE public.devices SET SCHEMA collection", sql_content)
+        self.assertIn("collection.devices", sql_content)
+        self.assertIn("collection.transfers", sql_content)
+        self.assertIn("collection.assessment_results", sql_content)
+        self.assertIn("collection.device_files", sql_content)
+
+        env_py = root / "migrations" / "env.py"
+        self.assertTrue(env_py.is_file())
+        env_content = env_py.read_text(encoding="utf-8")
+        self.assertIn('"version_table_schema", "collection"', env_content)
+
+    def test_20_supabase_storage_bucket_and_payload(self):
+        """20. Supabase Storage defaults to shared bucket 'ewaste-files' and constructs file retrieval links."""
+        from storage import SupabaseStorage
+        with patch.object(SupabaseStorage, "_ensure_bucket"):
+            s = SupabaseStorage(supabase_url="https://test.supabase.co", supabase_key="test-key")
+            self.assertEqual(s.bucket, "ewaste-files")
+
+        with self.app.app_context():
+            from models import Device, DeviceFile, db
+            dev = Device.query.filter_by(id="EW-2024-00128").first()
+            if not dev:
+                dev = Device(
+                    id="EW-TEST-FILE",
+                    name="Test File Device",
+                    type="Smartphone",
+                    brand="Apple",
+                    model="iPhone 13",
+                    year="2021",
+                    weight="0.18",
+                    condition="Good",
+                    status="Pending assessment",
+                )
+                db.session.add(dev)
+                db.session.commit()
+
+            d_file = DeviceFile(
+                device_id=dev.id,
+                file_type="image",
+                filename="test.png",
+                original_filename="test.png",
+                storage_key=f"collection/devices/{dev.id}/images/1234_test.png",
+                file_path=f"/api/v1/files/collection/devices/{dev.id}/images/1234_test.png",
+                content_type="image/png",
+                file_size=1024,
+                storage_provider="supabase",
+                is_private=False,
+            )
+            db.session.add(d_file)
+            db.session.commit()
+
+            # Mock storage service that creates signed URLs
+            mock_storage = MagicMock()
+            mock_storage.create_signed_url.return_value = "https://test.supabase.co/storage/v1/object/sign/ewaste-files/signed-path?token=xyz"
+
+            payload = dev.to_partner_payload("TRF-TEST-FILE", storage_service=mock_storage, base_url="https://collection.vercel.app")
+            self.assertEqual(payload["device_id"], dev.id)
+            self.assertTrue(len(payload["files"]) >= 1)
+            file_meta = next(f for f in payload["files"] if f["storage_key"] == d_file.storage_key)
+            self.assertEqual(file_meta["bucket"], "ewaste-files")
+            self.assertEqual(file_meta["storage_key"], d_file.storage_key)
+            self.assertIn("signed_url", file_meta)
+            self.assertEqual(file_meta["signed_url"], "https://test.supabase.co/storage/v1/object/sign/ewaste-files/signed-path?token=xyz")
 
 
 if __name__ == "__main__":

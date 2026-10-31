@@ -24,9 +24,13 @@ ALLOWED_TRANSITIONS = {
     "Completed": set(),
 }
 
+# Dedicated PostgreSQL schema exclusively owned by the Collection application
+SCHEMA = "collection"
+
 
 class Device(db.Model):
     __tablename__ = "devices"
+    __table_args__ = {"schema": SCHEMA}
 
     id = db.Column(db.String(64), primary_key=True)
     name = db.Column(db.String(128), nullable=False)
@@ -90,16 +94,28 @@ class Device(db.Model):
             self.condition = condition
         if year is not None:
             self.year = str(year)
+        elif "purchase_year" in kwargs:
+            self.year = str(kwargs.pop("purchase_year"))
         if weight is not None:
             self.weight = str(weight)
+        elif "weight_kg" in kwargs:
+            self.weight = str(kwargs.pop("weight_kg"))
         if damage is not None:
             self.damage = damage
+        elif "damage_description" in kwargs:
+            self.damage = kwargs.pop("damage_description")
         if power is not None:
             self.power = power
+        elif "power_status" in kwargs:
+            self.power = kwargs.pop("power_status")
         if screen is not None:
             self.screen = screen
+        elif "screen_condition" in kwargs:
+            self.screen = kwargs.pop("screen_condition")
         if battery is not None:
             self.battery = battery
+        elif "battery_condition" in kwargs:
+            self.battery = kwargs.pop("battery_condition")
         if image is not None:
             self.image = image
         if document is not None:
@@ -108,6 +124,36 @@ class Device(db.Model):
             self.created_at = created_at
         for k, v in kwargs.items():
             setattr(self, k, v)
+
+    @property
+    def purchase_year(self):
+        try:
+            return int(self.year)
+        except (ValueError, TypeError):
+            return self.year
+
+    @property
+    def weight_kg(self):
+        try:
+            return float(self.weight)
+        except (ValueError, TypeError):
+            return self.weight
+
+    @property
+    def power_status(self):
+        return self.power
+
+    @property
+    def screen_condition(self):
+        return self.screen
+
+    @property
+    def battery_condition(self):
+        return self.battery
+
+    @property
+    def damage_description(self):
+        return self.damage
 
     def __getitem__(self, item):
         return getattr(self, item, None)
@@ -156,7 +202,7 @@ class Device(db.Model):
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 
-    def to_partner_payload(self, transfer_id: str) -> dict:
+    def to_partner_payload(self, transfer_id: str, storage_service=None, base_url: str = "") -> dict:
         """Construct canonical backward-compatible partner payload conforming to API_CONTRACT.md."""
         purchase_year = None
         if self.year:
@@ -178,13 +224,25 @@ class Device(db.Model):
         if self.files:
             for f in self.files:
                 file_url = f"/uploads/{f.storage_key}" if not f.is_private else f"/api/v1/files/{f.storage_key}"
+                download_url = None
+                if storage_service and hasattr(storage_service, "create_signed_url"):
+                    try:
+                        download_url = storage_service.create_signed_url(f.storage_key, expires_in=86400)
+                    except Exception:
+                        download_url = None
+                if not download_url:
+                    download_url = f"{base_url.rstrip('/')}/api/v1/files/{f.storage_key}" if base_url else file_url
+
                 files_payload.append({
                     "file_type": f.file_type,
                     "original_filename": f.original_filename,
                     "storage_key": f.storage_key,
+                    "bucket": "ewaste-files",
                     "content_type": f.content_type,
                     "file_size": f.file_size,
                     "url": file_url,
+                    "download_url": download_url,
+                    "signed_url": download_url if (download_url and download_url.startswith("http")) else None,
                 })
 
         return {
@@ -221,9 +279,10 @@ class Device(db.Model):
 
 class Transfer(db.Model):
     __tablename__ = "transfers"
+    __table_args__ = {"schema": SCHEMA}
 
     id = db.Column(db.String(64), primary_key=True)
-    device_id = db.Column(db.String(64), db.ForeignKey("devices.id"), nullable=True)
+    device_id = db.Column(db.String(64), db.ForeignKey(f"{SCHEMA}.devices.id"), nullable=True)
     file = db.Column(db.String(128), nullable=False)
     sender = db.Column(db.String(64), nullable=False)
     receiver = db.Column(db.String(64), nullable=False)
@@ -317,9 +376,10 @@ class Transfer(db.Model):
 
 class AssessmentResult(db.Model):
     __tablename__ = "assessment_results"
+    __table_args__ = {"schema": SCHEMA}
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
-    device_id = db.Column(db.String(64), db.ForeignKey("devices.id"), unique=True, nullable=False)
+    device_id = db.Column(db.String(64), db.ForeignKey(f"{SCHEMA}.devices.id"), unique=True, nullable=False)
     repairability_score = db.Column(db.Integer, nullable=False)
     circular_recovery_score = db.Column(db.Integer, nullable=False)
     repair_cost = db.Column(db.Float, nullable=False)
@@ -409,9 +469,10 @@ class AssessmentResult(db.Model):
 
 class DeviceFile(db.Model):
     __tablename__ = "device_files"
+    __table_args__ = {"schema": SCHEMA}
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
-    device_id = db.Column(db.String(64), db.ForeignKey("devices.id"), nullable=False)
+    device_id = db.Column(db.String(64), db.ForeignKey(f"{SCHEMA}.devices.id"), nullable=False)
     file_type = db.Column(db.String(32), nullable=False)  # "image" or "document"
     filename = db.Column(db.String(128), nullable=False)
     original_filename = db.Column(db.String(256), nullable=False)
@@ -483,6 +544,7 @@ class DeviceFile(db.Model):
 
 class Metadata(db.Model):
     __tablename__ = "metadata"
+    __table_args__ = {"schema": SCHEMA}
 
     key = db.Column(db.String(64), primary_key=True)
     value = db.Column(db.String(256), nullable=True)

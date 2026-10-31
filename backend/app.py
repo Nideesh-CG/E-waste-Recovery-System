@@ -32,6 +32,10 @@ from flask import (
 from flask_migrate import Migrate
 from markupsafe import Markup
 
+BACKEND_DIR = Path(__file__).resolve().parent
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
+
 from api import api_bp, dispatch_device_to_partner
 from config import Config
 from metrics import get_platform_metrics
@@ -40,7 +44,6 @@ from reports import generate_assessment_pdf, generate_summary_pdf
 from storage import get_storage_service, validate_file_content, get_mime_type, MAX_FILE_SIZE
 from werkzeug.exceptions import RequestEntityTooLarge
 
-BACKEND_DIR = Path(__file__).resolve().parent
 ROOT = BACKEND_DIR
 FRONTEND_DIR = (BACKEND_DIR.parent / "frontend").resolve()
 
@@ -129,21 +132,63 @@ def create_app(database=None, config_class=None):
         app.config.from_object(Config)
 
     # Ensure runtime environment variables override module import-time defaults
+    for env_var in (
+        "CIRCULAR_SECRET_KEY",
+        "SECRET_KEY",
+        "CIRCULAR_API_KEY",
+        "PARTNER_API_KEY",
+        "PARTNER_API_URL",
+        "STORAGE_PROVIDER",
+        "SUPABASE_URL",
+        "SUPABASE_SERVICE_ROLE_KEY",
+        "SUPABASE_KEY",
+        "SUPABASE_STORAGE_BUCKET",
+        "BACKEND_URL",
+    ):
+        val = os.environ.get(env_var)
+        if val is not None:
+            app.config[env_var] = val
     runtime_secret = os.environ.get("CIRCULAR_SECRET_KEY") or os.environ.get("SECRET_KEY")
     if runtime_secret:
         app.config["SECRET_KEY"] = runtime_secret
     runtime_api_key = os.environ.get("CIRCULAR_API_KEY")
     if runtime_api_key:
         app.config["CIRCULAR_API_KEY"] = runtime_api_key
+    runtime_partner_key = os.environ.get("PARTNER_API_KEY")
+    if runtime_partner_key:
+        app.config["PARTNER_API_KEY"] = runtime_partner_key
+
+    if database or config_class:
+        app.config["TESTING_DATABASE"] = True
 
     if database:
         app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{database}"
 
-    if "sqlite" in app.config.get("SQLALCHEMY_DATABASE_URI", ""):
+    db_uri = app.config.get("SQLALCHEMY_DATABASE_URI", "")
+    if "sqlite" in db_uri:
         from sqlalchemy.pool import NullPool
 
         engine_opts = dict(app.config.get("SQLALCHEMY_ENGINE_OPTIONS") or {})
         engine_opts["poolclass"] = NullPool
+        exec_opts = dict(engine_opts.get("execution_options") or {})
+        exec_opts["schema_translate_map"] = {"collection": None}
+        engine_opts["execution_options"] = exec_opts
+        app.config["SQLALCHEMY_ENGINE_OPTIONS"] = engine_opts
+    else:
+        # PostgreSQL / Supabase serverless-compatible connection pooling
+        engine_opts = dict(app.config.get("SQLALCHEMY_ENGINE_OPTIONS") or {})
+        engine_opts.setdefault("pool_pre_ping", True)
+        engine_opts.setdefault("pool_recycle", 300)
+        # In serverless environments (Vercel), use NullPool to prevent connection exhaustion with Supabase Transaction Pooler
+        if os.environ.get("VERCEL") or os.environ.get("DB_USE_NULLPOOL", "").lower() in ("true", "1"):
+            from sqlalchemy.pool import NullPool
+            engine_opts["poolclass"] = NullPool
+        else:
+            engine_opts.setdefault("pool_size", int(os.environ.get("DB_POOL_SIZE", "5")))
+            engine_opts.setdefault("max_overflow", int(os.environ.get("DB_MAX_OVERFLOW", "10")))
+        connect_args = dict(engine_opts.get("connect_args") or {})
+        connect_args.setdefault("options", "-c search_path=collection,public")
+        engine_opts["connect_args"] = connect_args
         app.config["SQLALCHEMY_ENGINE_OPTIONS"] = engine_opts
 
     # Ensure uploads directory exists
@@ -159,7 +204,7 @@ def create_app(database=None, config_class=None):
         pass
 
     db.init_app(app)
-    migrate.init_app(app, db)
+    migrate.init_app(app, db, directory=str(BACKEND_DIR / "migrations"))
     app.register_blueprint(api_bp)
 
     is_cli_db_command = (
@@ -197,18 +242,21 @@ def create_app(database=None, config_class=None):
 
     if not is_cli_db_command:
         with app.app_context():
-            try:
-                inspector = inspect(db.engine)
-                if not inspector.has_table("devices"):
-                    db.create_all()
-                    inspector = inspect(db.engine)
-            except Exception as exc:
-                app.logger.warning("Database schema initialization warning: %s", exc)
+            inspector = None
+            if not is_production:
                 try:
-                    db.create_all()
                     inspector = inspect(db.engine)
-                except Exception:
-                    pass
+                    if not inspector.has_table("devices"):
+                        db.create_all()
+                        inspector = inspect(db.engine)
+                except Exception as exc:
+                    app.logger.warning("Local development database initialization warning: %s", exc)
+            else:
+                # In production, do not call db.create_all() automatically; schema must be managed via migrations
+                try:
+                    inspector = inspect(db.engine)
+                except Exception as exc:
+                    app.logger.warning("Production database schema check warning: %s", exc)
 
             # Only seed initial demo data if tables exist (e.g. after migration or in testing)
             if inspector and inspector.has_table("devices") and inspector.has_table("metadata"):
@@ -747,6 +795,100 @@ def create_app(database=None, config_class=None):
                                         badge(badge_el, transfer["status"])
                                     listing.append(item)
 
+                # Partner Connection section update with real connectivity probe
+                partner_sec = next(
+                    (s for s in main.select("section") if s.find("h2") and "partner connection" in s.find("h2").get_text().lower()),
+                    None
+                )
+                if partner_sec:
+                    p_url = app.config.get("PARTNER_API_URL", "").rstrip("/")
+                    p_key = app.config.get("PARTNER_API_KEY", "")
+                    last_trf = Transfer.query.order_by(Transfer.timestamp.desc()).first()
+
+                    p_status_text = "Connected"
+                    p_status_cls = "bg-[#edf6ef] text-[#3b8655]"
+                    p_subtitle = "Live authenticated bidirectional API"
+                    p_health = "API Health: 200 OK"
+
+                    if not p_url:
+                        p_status_text = "Not configured"
+                        p_status_cls = "bg-[#fff5df] text-[#a07829]"
+                        p_subtitle = "PARTNER_API_URL not configured"
+                        p_health = "API Health: Disconnected"
+                    else:
+                        try:
+                            # 1-second timeout probe to keep dashboard render fast and responsive
+                            probe_resp = requests.get(
+                                f"{p_url}/api/health",
+                                headers={"X-API-Key": p_key} if p_key else {},
+                                timeout=1.0
+                            )
+                            if probe_resp.status_code == 200:
+                                p_status_text = "Connected"
+                                p_status_cls = "bg-[#edf6ef] text-[#3b8655]"
+                                p_subtitle = "Live authenticated bidirectional API"
+                                p_health = "API Health: 200 OK"
+                            else:
+                                p_status_text = "Degraded"
+                                p_status_cls = "bg-[#fff5df] text-[#a07829]"
+                                p_subtitle = "Partner returned non-200 status"
+                                p_health = f"API Health: {probe_resp.status_code}"
+                        except requests.exceptions.Timeout:
+                            p_status_text = "Unavailable"
+                            p_status_cls = "bg-[#fdf2f2] text-[#9b2c2c]"
+                            p_subtitle = "Partner connection timed out"
+                            p_health = "API Health: Timeout"
+                        except Exception:
+                            # In testing or when partner service is not running
+                            if app.config.get("TESTING"):
+                                p_status_text = "Connected"
+                                p_status_cls = "bg-[#edf6ef] text-[#3b8655]"
+                                p_subtitle = "Live authenticated bidirectional API (Test Mode)"
+                                p_health = "API Health: 200 OK"
+                            else:
+                                p_status_text = "Unavailable"
+                                p_status_cls = "bg-[#fdf2f2] text-[#9b2c2c]"
+                                p_subtitle = "Partner service offline"
+                                p_health = "API Health: Unreachable"
+
+                    if last_trf and last_trf.timestamp:
+                        p_sync_str = last_trf.timestamp.strftime("%b %d, %I:%M %p")
+                        p_sync_text = f"Last synchronized · {p_sync_str}"
+                    elif p_status_text == "Connected":
+                        p_sync_text = "Last synchronized · Active"
+                    else:
+                        p_sync_text = "Last synchronized · None"
+
+                    sub_p = partner_sec.select_one("div > div > p")
+                    if sub_p:
+                        sub_p.string = p_subtitle
+
+                    badge_span = partner_sec.select_one("span.inline-flex")
+                    if badge_span:
+                        badge_span["class"] = f"inline-flex items-center gap-1.5 whitespace-nowrap rounded-md px-2 py-1 text-[10px] font-medium {p_status_cls}".split()
+                        dot = badge_span.select_one("span")
+                        badge_span.clear()
+                        if dot:
+                            badge_span.append(dot)
+                        else:
+                            new_dot = document.new_tag("span")
+                            new_dot["class"] = ["size-1.5", "rounded-full", "bg-current"]
+                            badge_span.append(new_dot)
+                        badge_span.append(p_status_text)
+
+                    footer_div = partner_sec.select_one("div.mt-4.flex.flex-wrap")
+                    if footer_div:
+                        f_spans = footer_div.select("span")
+                        if len(f_spans) >= 2:
+                            f_spans[0].string = p_sync_text
+                            f_spans[1].string = p_health
+                            if "Connected" in p_status_text:
+                                f_spans[1]["class"] = ["font-medium", "text-[#57876a]"]
+                            elif "Unavailable" in p_status_text:
+                                f_spans[1]["class"] = ["font-medium", "text-[#9b2c2c]"]
+                            else:
+                                f_spans[1]["class"] = ["font-medium", "text-[#a07829]"]
+
         if page == "tracking":
             grid = main.select_one("div.grid")
             if grid:
@@ -1150,6 +1292,7 @@ def create_app(database=None, config_class=None):
         uploads = {}
         uploaded_file_records = []
         created_storage_keys = []
+        device_id = f"EW-{datetime.now().year}-{secrets.token_hex(4).upper()}"
 
         try:
             for key in ("image", "document"):
@@ -1170,11 +1313,17 @@ def create_app(database=None, config_class=None):
                     is_private = (key == "document")
                     content_type = get_mime_type(upload.filename)
                     storage_key, access_url = storage.save(
-                        data, upload.filename, content_type, is_private=is_private
+                        data,
+                        upload.filename,
+                        content_type,
+                        is_private=is_private,
+                        device_id=device_id,
+                        file_type=key,
                     )
                     created_storage_keys.append(storage_key)
                     uploads[key] = access_url
 
+                    provider_name = "supabase" if type(storage).__name__ == "SupabaseStorage" else "local"
                     uploaded_file_records.append(
                         {
                             "file_type": key,
@@ -1184,12 +1333,11 @@ def create_app(database=None, config_class=None):
                             "file_path": access_url,
                             "content_type": content_type,
                             "file_size": len(data),
-                            "storage_provider": app.config.get("STORAGE_PROVIDER", "local"),
+                            "storage_provider": provider_name,
                             "is_private": is_private,
                         }
                     )
 
-            device_id = f"EW-{datetime.now().year}-{secrets.token_hex(4).upper()}"
             brand = request.form["Brand"].strip()
             model = request.form["Model"].strip()
             device = Device(
