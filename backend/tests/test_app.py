@@ -2157,6 +2157,33 @@ class CircularTests(unittest.TestCase):
                 from werkzeug.middleware.proxy_fix import ProxyFix
                 self.assertIsInstance(prod_app.wsgi_app, ProxyFix)
 
+    def test_vercel_preview_environment_configuration(self):
+        """Test 11: Vercel Preview environment requires SECRET_KEY and mounts ProxyFix."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_db = Path(temp_dir) / "preview_test.sqlite3"
+            with patch.dict(os.environ, {
+                "VERCEL": "1",
+                "VERCEL_ENV": "preview",
+                "SECRET_KEY": "preview-stable-secret-key-12345",
+                "CIRCULAR_API_KEY": "preview-api-key"
+            }):
+                preview_app = create_app(temp_db)
+                from werkzeug.middleware.proxy_fix import ProxyFix
+                self.assertIsInstance(preview_app.wsgi_app, ProxyFix)
+                self.assertEqual(preview_app.config["SECRET_KEY"], "preview-stable-secret-key-12345")
+                self.assertEqual(preview_app.config["SESSION_COOKIE_NAME"], "circular_session")
+                self.assertTrue(preview_app.config["SESSION_COOKIE_SECURE"])
+
+    def test_csrf_injection_case_insensitive_form(self):
+        """Test 12: Form CSRF injection handles uppercase and lowercase POST methods."""
+        res = self.client.get("/register")
+        html = soup(res.data.decode("utf-8"))
+        for form in html.find_all("form"):
+            if str(form.get("method", "")).lower() == "post":
+                csrf_inp = form.find("input", {"name": "csrf"})
+                self.assertIsNotNone(csrf_inp, "POST form must contain injected csrf input")
+                self.assertTrue(len(csrf_inp.get("value", "")) >= 32)
+
 
 if __name__ == "__main__":
     unittest.main()

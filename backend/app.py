@@ -128,6 +128,14 @@ def create_app(database=None, config_class=None):
     else:
         app.config.from_object(Config)
 
+    # Ensure runtime environment variables override module import-time defaults
+    runtime_secret = os.environ.get("CIRCULAR_SECRET_KEY") or os.environ.get("SECRET_KEY")
+    if runtime_secret:
+        app.config["SECRET_KEY"] = runtime_secret
+    runtime_api_key = os.environ.get("CIRCULAR_API_KEY")
+    if runtime_api_key:
+        app.config["CIRCULAR_API_KEY"] = runtime_api_key
+
     if database:
         app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{database}"
 
@@ -165,6 +173,8 @@ def create_app(database=None, config_class=None):
         or bool(os.environ.get("RENDER"))
     )
     app.config["IS_PRODUCTION"] = is_production
+    if is_production or (os.environ.get("VERCEL") and os.environ.get("VERCEL_ENV") != "development"):
+        app.config["SESSION_COOKIE_SECURE"] = True
 
     from werkzeug.middleware.proxy_fix import ProxyFix
 
@@ -1080,15 +1090,16 @@ def create_app(database=None, config_class=None):
                     ).p
                     reports_list.append(empty_msg)
 
-        for f in document.select("form[method=post]"):
-            existing_csrf = f.select_one("input[name=csrf]")
-            if existing_csrf:
-                existing_csrf["value"] = csrf()
-            else:
-                field = document.new_tag(
-                    "input", attrs={"type": "hidden", "name": "csrf", "value": csrf()}
-                )
-                f.insert(0, field)
+        for f in document.find_all("form"):
+            if str(f.get("method", "")).strip().lower() == "post":
+                existing_csrf = f.select_one("input[name=csrf]")
+                if existing_csrf:
+                    existing_csrf["value"] = csrf()
+                else:
+                    field = document.new_tag(
+                        "input", attrs={"type": "hidden", "name": "csrf", "value": csrf()}
+                    )
+                    f.insert(0, field)
 
         return render_template(
             "base.html", content=Markup(str(document)), csrf=csrf()
