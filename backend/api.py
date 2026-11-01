@@ -95,7 +95,8 @@ def verify_api_key() -> bool:
 def authenticate():
     """Global authentication guard for API endpoints."""
     # Health check and notifications are public
-    if request.path in ("/api/health", "/api/v1/notifications"):
+    clean_path = request.path.rstrip("/")
+    if clean_path in ("/api/health", "/api/v1/health", "/api/v1/notifications"):
         return None
 
     # Immediate rejection of path traversal on files endpoint
@@ -125,6 +126,7 @@ def authenticate():
 
 
 @api_bp.get("/health")
+@api_bp.get("/v1/health")
 def health_check():
     """Service health and database connectivity probe (Public)."""
     try:
@@ -366,23 +368,44 @@ def dispatch_device_to_partner(device: Device, transfer_id: Optional[str] = None
         success = False
         message = "Demo transfer queued. No external API is connected."
 
-    transfer = Transfer(
-        id=transfer_id,
-        device_id=device.id,
-        file=file_name,
-        sender="Collection",
-        receiver="Refurbishment",
-        status=transfer_status,
-        time=f"Today, {now.strftime('%I:%M %p')}",
-        timestamp=now,
-        http_status=http_status,
-        response_body=response_body,
-        endpoint=target_endpoint,
-        payload=json.dumps(payload),
-        idempotency_key=transfer_id,
-    )
-    db.session.add(transfer)
-    db.session.commit()
+    existing_transfer = Transfer.query.filter(
+        (Transfer.id == transfer_id) | (Transfer.idempotency_key == transfer_id)
+    ).first()
+    if existing_transfer:
+        transfer = existing_transfer
+        transfer.status = transfer_status
+        transfer.time = f"Today, {now.strftime('%I:%M %p')}"
+        transfer.timestamp = now
+        transfer.http_status = http_status
+        transfer.response_body = response_body
+        transfer.endpoint = target_endpoint
+        transfer.payload = json.dumps(payload)
+    else:
+        transfer = Transfer(
+            id=transfer_id,
+            device_id=device.id,
+            file=file_name,
+            sender="Collection",
+            receiver="Refurbishment",
+            status=transfer_status,
+            time=f"Today, {now.strftime('%I:%M %p')}",
+            timestamp=now,
+            http_status=http_status,
+            response_body=response_body,
+            endpoint=target_endpoint,
+            payload=json.dumps(payload),
+            idempotency_key=transfer_id,
+        )
+        db.session.add(transfer)
+
+    try:
+        db.session.commit()
+    except Exception as exc:
+        db.session.rollback()
+        current_app.logger.error(
+            "Failed to commit transfer dispatch record | transfer_id=%s, error=%s",
+            transfer_id, exc, exc_info=True
+        )
     return transfer, success, message
 
 
@@ -880,24 +903,28 @@ def receive_assessment():
 def get_notifications():
     """Retrieve recent notifications derived from real database records."""
     items = []
-    recent_transfers = Transfer.query.order_by(Transfer.timestamp.desc()).limit(3).all()
-    for t in recent_transfers:
-        items.append({
-            "id": t.id,
-            "type": "transfer",
-            "title": f"Transfer {t.id} ({t.status})",
-            "detail": f"{t.sender} → {t.receiver}: {t.file}",
-            "time": t.time or (t.timestamp.strftime("%I:%M %p") if t.timestamp else "")
-        })
-    recent_asmts = AssessmentResult.query.order_by(AssessmentResult.assessed_at.desc()).limit(3).all()
-    for a in recent_asmts:
-        items.append({
-            "id": f"asmt-{a.device_id}",
-            "type": "assessment",
-            "title": f"Assessment received for {a.device_id}",
-            "detail": f"Outcome: {a.recommendation} (Score: {a.circular_recovery_score}/100)",
-            "time": a.assessed_at.strftime("%I:%M %p") if a.assessed_at else ""
-        })
+    try:
+        recent_transfers = Transfer.query.order_by(Transfer.timestamp.desc()).limit(3).all()
+        for t in recent_transfers:
+            items.append({
+                "id": t.id,
+                "type": "transfer",
+                "title": f"Transfer {t.id} ({t.status})",
+                "detail": f"{t.sender} → {t.receiver}: {t.file}",
+                "time": t.time or (t.timestamp.strftime("%I:%M %p") if t.timestamp else "")
+            })
+        recent_asmts = AssessmentResult.query.order_by(AssessmentResult.assessed_at.desc()).limit(3).all()
+        for a in recent_asmts:
+            items.append({
+                "id": f"asmt-{a.device_id}",
+                "type": "assessment",
+                "title": f"Assessment received for {a.device_id}",
+                "detail": f"Outcome: {a.recommendation} (Score: {a.circular_recovery_score}/100)",
+                "time": a.assessed_at.strftime("%I:%M %p") if a.assessed_at else ""
+            })
+    except Exception as exc:
+        current_app.logger.warning("Error loading notifications: %s", exc)
+
     return jsonify({
         "status": "success",
         "notifications": items
@@ -916,7 +943,11 @@ def get_private_file(storage_key):
     ):
         return jsonify({"error": "Bad Request", "message": "Invalid file key"}), 400
 
-    d_file = DeviceFile.query.filter_by(storage_key=storage_key).first()
+    d_file = DeviceFile.query.filter(
+        (DeviceFile.storage_key == storage_key)
+        | (DeviceFile.filename == storage_key)
+        | (DeviceFile.storage_key.endswith("/" + storage_key))
+    ).first()
     if not d_file:
         return jsonify({"error": "Not Found", "message": "File not found"}), 404
 
@@ -925,9 +956,9 @@ def get_private_file(storage_key):
     # If short-lived signed URL is requested and supported by storage backend
     if request.args.get("signed") == "true" and hasattr(storage, "create_signed_url"):
         try:
-            signed_url = storage.create_signed_url(storage_key, expires_in=3600)
+            signed_url = storage.create_signed_url(d_file.storage_key, expires_in=3600)
             return jsonify({
-                "storage_key": storage_key,
+                "storage_key": d_file.storage_key,
                 "signed_url": signed_url,
                 "expires_in": 3600
             }), 200
@@ -935,7 +966,7 @@ def get_private_file(storage_key):
             current_app.logger.warning("Could not generate signed URL: %s", e)
 
     try:
-        file_bytes, content_type = storage.retrieve(storage_key)
+        file_bytes, content_type = storage.retrieve(d_file.storage_key)
         resp = send_file(
             io.BytesIO(file_bytes),
             mimetype=content_type or d_file.content_type or "application/octet-stream",
