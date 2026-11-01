@@ -42,38 +42,52 @@ def verify_api_key() -> bool:
     Strictly checks headers only; credentials from query parameters are prohibited.
     Accepts valid inbound partner keys (COLLECTION_API_KEY, CIRCULAR_API_KEY) and ADMIN_API_KEY.
     """
-    valid_expected_keys = [
-        k for k in [
-            current_app.config.get("COLLECTION_API_KEY"),
-            current_app.config.get("CIRCULAR_API_KEY"),
-            current_app.config.get("ADMIN_API_KEY"),
-        ]
-        if k and str(k).strip()
+    key_sources = [
+        ("COLLECTION_API_KEY", current_app.config.get("COLLECTION_API_KEY")),
+        ("CIRCULAR_API_KEY", current_app.config.get("CIRCULAR_API_KEY")),
+        ("ADMIN_API_KEY", current_app.config.get("ADMIN_API_KEY")),
     ]
-    is_prod = current_app.config.get("IS_PRODUCTION", False)
+    valid_expected_keys = [(name, str(k).strip()) for name, k in key_sources if k and str(k).strip()]
 
     # In production or development, missing expected keys must fail
     if not valid_expected_keys:
-        current_app.logger.warning("Inbound API verification failed: COLLECTION_API_KEY / CIRCULAR_API_KEY not configured")
+        current_app.logger.warning(
+            "[ASSESSMENT_CALLBACK_STAGE_2] Inbound API verification failed: No inbound API keys configured"
+        )
         return False
 
     auth_header = request.headers.get("Authorization", "")
     api_key_header = request.headers.get("X-API-Key", "")
 
     provided_key = None
+    auth_scheme = None
     if api_key_header:
         provided_key = api_key_header.strip()
+        auth_scheme = "X-API-Key"
     elif auth_header.startswith("Bearer "):
         provided_key = auth_header.split("Bearer ", 1)[1].strip()
+        auth_scheme = "Bearer"
 
     # Reject query parameter credentials and empty keys
     if not provided_key:
+        current_app.logger.warning(
+            "[ASSESSMENT_CALLBACK_STAGE_2] Authentication failed: No key header provided | path=%s",
+            request.path
+        )
         return False
 
-    for exp_key in valid_expected_keys:
+    for key_name, exp_key in valid_expected_keys:
         if secrets.compare_digest(provided_key, exp_key):
+            current_app.logger.info(
+                "[ASSESSMENT_CALLBACK_STAGE_2] Authentication succeeded | path=%s, scheme=%s, matched_source=%s",
+                request.path, auth_scheme, key_name
+            )
             return True
 
+    current_app.logger.warning(
+        "[ASSESSMENT_CALLBACK_STAGE_2] Authentication failed: Provided key did not match any authorized key | path=%s, scheme=%s",
+        request.path, auth_scheme
+    )
     return False
 
 
@@ -425,6 +439,44 @@ def get_transfer(transfer_id):
     return jsonify(transfer.to_dict()), 200
 
 
+def extract_numeric(val, field_name: str, min_val: float = None, max_val: float = None, default=None):
+    """Safely parse numbers from floats, ints, or formatted strings (currency, commas, units)."""
+    if val is None or val == "":
+        return default
+    if isinstance(val, bool):
+        raise ValueError(f"{field_name} cannot be a boolean")
+    if isinstance(val, (int, float)):
+        num = float(val)
+    elif isinstance(val, str):
+        cleaned = val.strip()
+        for symbol in ("₹", "$", "€", "£", ","):
+            cleaned = cleaned.replace(symbol, "")
+        cleaned = cleaned.strip()
+        if "/" in cleaned:
+            cleaned = cleaned.split("/")[0].strip()
+        else:
+            parts = cleaned.split()
+            if parts:
+                cleaned = parts[0].strip()
+        try:
+            num = float(cleaned)
+        except (ValueError, TypeError):
+            raise ValueError(f"{field_name} must be a valid number, got '{val}'")
+    else:
+        try:
+            num = float(val)
+        except (ValueError, TypeError):
+            raise ValueError(f"{field_name} must be a valid number, got '{val}'")
+
+    if not math.isfinite(num):
+        raise ValueError(f"{field_name} must be a finite number")
+    if min_val is not None and num < min_val:
+        raise ValueError(f"{field_name} must be >= {min_val}")
+    if max_val is not None and num > max_val:
+        raise ValueError(f"{field_name} must be <= {max_val}")
+    return num
+
+
 @api_bp.post("/v1/assessment-results")
 @api_bp.post("/v1/collection/assessments")
 def receive_assessment():
@@ -433,11 +485,21 @@ def receive_assessment():
     Enforces strict field validation, non-negative values, range checks,
     transactional persistence, and idempotency handling.
     """
+    current_app.logger.info(
+        "[ASSESSMENT_CALLBACK_STAGE_1] Request received | path=%s, method=%s, remote_addr=%s, content_type=%s",
+        request.path, request.method, request.remote_addr, request.content_type
+    )
+
     if not request.is_json:
+        current_app.logger.warning(
+            "[ASSESSMENT_CALLBACK_STAGE_1] Rejected non-JSON request | content_type=%s",
+            request.content_type
+        )
         return jsonify({"error": "Bad Request", "message": "JSON body required"}), 400
 
     data = request.get_json(silent=True)
-    if not data:
+    if not data or not isinstance(data, dict):
+        current_app.logger.warning("[ASSESSMENT_CALLBACK_STAGE_1] Empty or non-dict JSON body")
         return jsonify({"error": "Bad Request", "message": "Empty or malformed JSON payload"}), 400
 
     # 1. Check idempotency key (header or payload)
@@ -455,95 +517,87 @@ def receive_assessment():
         or data.get("retry")
     )
     if idempotency_key and not is_force:
-        existing_transfer = Transfer.query.filter_by(idempotency_key=str(idempotency_key)).first()
-        if existing_transfer:
-            existing_dev = Device.query.filter_by(id=existing_transfer.device_id).first()
-            existing_asmt = existing_dev.assessment if existing_dev else None
-            if existing_asmt:
-                return jsonify({
-                    "success": True,
-                    "status": "success",
-                    "idempotent": True,
-                    "message": "Assessment received successfully",
-                    "transfer_id": existing_transfer.id,
-                    "device_id": existing_transfer.device_id,
-                    "assessment_id": data.get("assessment_id") or str(idempotency_key),
-                    "new_device_status": existing_dev.status if existing_dev else "Completed",
-                    "assessment": existing_asmt.to_dict()
-                }), 200
+        try:
+            existing_transfer = Transfer.query.filter_by(idempotency_key=str(idempotency_key)).first()
+            if existing_transfer:
+                existing_dev = Device.query.filter_by(id=existing_transfer.device_id).first()
+                existing_asmt = AssessmentResult.query.filter_by(device_id=existing_transfer.device_id).first()
+                if existing_asmt:
+                    current_app.logger.info(
+                        "[ASSESSMENT_CALLBACK_IDEMPOTENT] Duplicate delivery returned idempotent response | idempotency_key=%s, device_id=%s, transfer_id=%s",
+                        idempotency_key, existing_transfer.device_id, existing_transfer.id
+                    )
+                    return jsonify({
+                        "success": True,
+                        "status": "success",
+                        "idempotent": True,
+                        "message": "Assessment received successfully",
+                        "transfer_id": existing_transfer.id,
+                        "device_id": existing_transfer.device_id,
+                        "assessment_id": data.get("assessment_id") or str(idempotency_key),
+                        "new_device_status": existing_dev.status if existing_dev else "Completed",
+                        "assessment": existing_asmt.to_dict()
+                    }), 200
+        except Exception as idemp_err:
+            current_app.logger.warning(
+                "[ASSESSMENT_CALLBACK_IDEMPOTENT] Querying existing transfer encountered warning: %s",
+                idemp_err, exc_info=True
+            )
 
     # 2. Check device existence first
     device_id = data.get("device_id")
     if not device_id:
+        current_app.logger.warning("[ASSESSMENT_CALLBACK_STAGE_3] Validation failure: device_id is missing")
         return jsonify({"error": "Validation Error", "message": "device_id is required"}), 400
 
-    device = Device.query.filter_by(id=str(device_id).strip()).first()
-    if not device:
-        return jsonify({"error": "Not Found", "message": f"Device {device_id} not found"}), 404
-
-    # 3. Numeric range and format validation with math.isfinite()
+    clean_device_id = str(device_id).strip()
+    failure_stage = "device_lookup"
     try:
-        if "repairability_score" in data and data["repairability_score"] is not None:
-            if isinstance(data["repairability_score"], bool):
-                return jsonify({"error": "Validation Error", "message": "repairability_score must be a number between 0 and 100"}), 400
-            try:
-                r_val = float(data["repairability_score"])
-            except (ValueError, TypeError):
-                return jsonify({"error": "Validation Error", "message": "repairability_score must be a number between 0 and 100"}), 400
-            if not math.isfinite(r_val) or not (0 <= r_val <= 100):
-                return jsonify({"error": "Validation Error", "message": "repairability_score must be a number between 0 and 100"}), 400
-            repairability = round(r_val, 2)
-        else:
-            repairability = None
+        device = Device.query.filter_by(id=clean_device_id).first()
+    except Exception as db_err:
+        current_app.logger.error(
+            "[ASSESSMENT_CALLBACK_ERROR] Database query failure during device lookup | device_id=%s, error=%s",
+            clean_device_id, db_err, exc_info=True
+        )
+        return jsonify({
+            "success": False,
+            "error": "Internal Error",
+            "message": f"Database error looking up device {clean_device_id}: {type(db_err).__name__}"
+        }), 500
 
-        if "circular_recovery_score" in data and data["circular_recovery_score"] is not None:
-            if isinstance(data["circular_recovery_score"], bool):
-                return jsonify({"error": "Validation Error", "message": "circular_recovery_score must be a number between 0 and 100"}), 400
-            try:
-                c_val = float(data["circular_recovery_score"])
-            except (ValueError, TypeError):
-                return jsonify({"error": "Validation Error", "message": "circular_recovery_score must be a number between 0 and 100"}), 400
-            if not math.isfinite(c_val) or not (0 <= c_val <= 100):
-                return jsonify({"error": "Validation Error", "message": "circular_recovery_score must be a number between 0 and 100"}), 400
-            recovery_score = round(c_val, 2)
-        else:
+    if not device:
+        current_app.logger.warning(
+            "[ASSESSMENT_CALLBACK_STAGE_4] Device not found | device_id=%s",
+            clean_device_id
+        )
+        return jsonify({"error": "Not Found", "message": f"Device {clean_device_id} not found"}), 404
+
+    # 3. Numeric range and format validation with extract_numeric()
+    failure_stage = "payload_validation"
+    try:
+        r_raw = data.get("repairability_score") if "repairability_score" in data else data.get("repairability")
+        repairability = extract_numeric(r_raw, "repairability_score", min_val=0.0, max_val=100.0)
+
+        c_raw = data.get("circular_recovery_score") if "circular_recovery_score" in data else data.get("circular_score")
+        recovery_score = extract_numeric(c_raw, "circular_recovery_score", min_val=0.0, max_val=100.0)
+        if recovery_score is None:
             recovery_score = repairability  # Default fallback if partner payload does not supply separate recovery score
 
-        # Accept repair_cost or estimated_repair_cost
         rc_raw = data.get("repair_cost") if "repair_cost" in data else data.get("estimated_repair_cost")
-        if rc_raw is not None:
-            if isinstance(rc_raw, bool):
-                return jsonify({"error": "Validation Error", "message": "repair_cost must be finite and >= 0"}), 400
-            repair_cost = float(rc_raw)
-            if not math.isfinite(repair_cost) or repair_cost < 0:
-                return jsonify({"error": "Validation Error", "message": "repair_cost must be finite and >= 0"}), 400
-        else:
-            repair_cost = None
+        repair_cost = extract_numeric(rc_raw, "repair_cost", min_val=0.0)
 
-        # Accept component_value or component_recovery_value
         comp_val_raw = data.get("component_value") if "component_value" in data else data.get("component_recovery_value")
-        if comp_val_raw is not None:
-            if isinstance(comp_val_raw, bool):
-                return jsonify({"error": "Validation Error", "message": "component_value must be finite and >= 0"}), 400
-            component_val = float(comp_val_raw)
-            if not math.isfinite(component_val) or component_val < 0:
-                return jsonify({"error": "Validation Error", "message": "component_value must be finite and >= 0"}), 400
-        else:
-            component_val = None
+        component_val = extract_numeric(comp_val_raw, "component_value", min_val=0.0)
 
-        # Accept co2_avoided_kg or environmental_benefit
         co2_raw = data.get("co2_avoided_kg") if "co2_avoided_kg" in data else data.get("environmental_benefit")
-        if co2_raw is not None:
-            if isinstance(co2_raw, bool):
-                return jsonify({"error": "Validation Error", "message": "co2_avoided_kg must be finite and >= 0"}), 400
-            co2_avoided = float(co2_raw)
-            if not math.isfinite(co2_avoided) or co2_avoided < 0:
-                return jsonify({"error": "Validation Error", "message": "co2_avoided_kg must be finite and >= 0"}), 400
-        else:
-            co2_avoided = None
+        co2_avoided = extract_numeric(co2_raw, "co2_avoided_kg", min_val=0.0)
 
-    except (TypeError, ValueError) as err:
-        return jsonify({"error": "Validation Error", "message": f"Invalid numeric field value: {err}"}), 400
+    except ValueError as val_err:
+        current_app.logger.warning(
+            "[ASSESSMENT_CALLBACK_STAGE_3] Numeric validation error | device_id=%s, error=%s",
+            clean_device_id, val_err
+        )
+        return jsonify({"error": "Validation Error", "message": str(val_err)}), 400
 
     # 4. Required field presence validation - NO fabricated defaults
     rec_val = data.get("recommendation") or data.get("recommended_action")
@@ -555,6 +609,10 @@ def receive_assessment():
         or co2_avoided is None
         or not rec_val
     ):
+        current_app.logger.warning(
+            "[ASSESSMENT_CALLBACK_STAGE_3] Missing required fields | device_id=%s, repairability=%s, recovery_score=%s, repair_cost=%s, component_val=%s, co2=%s, rec_val=%s",
+            clean_device_id, repairability, recovery_score, repair_cost, component_val, co2_avoided, bool(rec_val)
+        )
         return jsonify({
             "error": "Validation Error",
             "message": "Missing required assessment fields: repairability_score, circular_recovery_score, repair_cost, component_value, recommendation, co2_avoided_kg"
@@ -570,12 +628,16 @@ def receive_assessment():
     elif rec_clean in CANONICAL_RECOMMENDATIONS:
         canonical_rec = rec_clean
     else:
+        current_app.logger.warning(
+            "[ASSESSMENT_CALLBACK_STAGE_3] Unsupported recommendation | device_id=%s, recommendation=%s",
+            clean_device_id, raw_rec
+        )
         return jsonify({
             "error": "Validation Error",
             "message": f"Unsupported recommendation '{raw_rec}'. Must be one of: PARTS_RECOVERY, RECYCLE, REFURBISH, REJECT, SAFE_DISPOSAL"
         }), 400
 
-    # 6. String length limits
+    # 6. String length limits and metadata fields
     assessed_by = str(data.get("assessed_by", "GreenTech Refurbishment Partner")).strip()[:128]
     notes = str(data.get("notes") or data.get("technical_summary") or "").strip()[:2000]
 
@@ -602,35 +664,42 @@ def receive_assessment():
         new_status = "Refurbishment"
     elif canonical_rec == "PARTS_RECOVERY":
         new_status = "Parts recovery"
-    elif canonical_rec in ("RECYCLE", "SAFE_DISPOSAL"):
+    elif canonical_rec in ("RECYCLE", "SAFE_DISPOSAL", "REJECT"):
         new_status = "Completed"
-    elif canonical_rec == "REJECT":
-        # Explicit business mapping: REJECT signifies the device cannot be refurbished or harvested.
-        # Recommendation is recorded as 'REJECT' and device transitions to 'Completed' (triage conclusion).
+    else:
         new_status = "Completed"
+
+    current_app.logger.info(
+        "[ASSESSMENT_CALLBACK_STAGE_3] Payload validation succeeded | device_id=%s, repairability=%.2f, recovery_score=%.2f, repair_cost=%.2f, component_val=%.2f, co2_avoided=%.2f, recommendation=%s, new_status=%s",
+        clean_device_id, repairability, recovery_score, repair_cost, component_val, co2_avoided, canonical_rec, new_status
+    )
 
     # Verify lifecycle prerequisites: device MUST be in 'Processing' or already in target new_status (for idempotent retries/resends)
     if device.status != "Processing" and device.status != new_status:
+        current_app.logger.warning(
+            "[ASSESSMENT_CALLBACK_STAGE_4] State conflict | device_id=%s, current_status=%s, target_status=%s",
+            clean_device_id, device.status, new_status
+        )
         return jsonify({
             "error": "Conflict",
-            "message": f"Device {device_id} is in status '{device.status}' and cannot transition to '{new_status}'. Device must be in 'Processing' before assessment can be applied."
+            "message": f"Device {clean_device_id} is in status '{device.status}' and cannot transition to '{new_status}'. Device must be in 'Processing' before assessment can be applied."
         }), 409
 
-    if device.status == "Processing" and not device.can_transition_to(new_status):
-        return jsonify({
-            "error": "Conflict",
-            "message": f"Device {device_id} is in status '{device.status}' and cannot transition to '{new_status}'."
-        }), 409
+    current_app.logger.info(
+        "[ASSESSMENT_CALLBACK_STAGE_4] Device lookup result | device_id=%s, found=True, current_status=%s, target_status=%s",
+        clean_device_id, device.status, new_status
+    )
 
-    assessment_id_val = str(data.get("assessment_id") or f"ASM-{device.id}")
+    assessment_id_val = str(data.get("assessment_id") or f"ASM-{clean_device_id}")
 
     # Transactional execution
     failure_stage = "assessment_persistence"
     try:
         # Save or update AssessmentResult
-        assessment = AssessmentResult.query.filter_by(device_id=device_id).first()
+        assessment = AssessmentResult.query.filter_by(device_id=clean_device_id).first()
+        is_update = bool(assessment)
         if not assessment:
-            assessment = AssessmentResult(device_id=device_id)
+            assessment = AssessmentResult(device_id=clean_device_id)
             db.session.add(assessment)
 
         assessment.repairability_score = repairability
@@ -650,9 +719,14 @@ def receive_assessment():
         else:
             device.status = new_status
 
+        current_app.logger.info(
+            "[ASSESSMENT_CALLBACK_STAGE_5] Assessment record prepared | device_id=%s, action=%s, target_status=%s",
+            clean_device_id, "UPDATE" if is_update else "CREATE", device.status
+        )
+
         # Log inbound transfer with idempotency key (upsert to avoid unique constraint violations)
         now = datetime.now(timezone.utc)
-        file_id = device_id.replace("EW-", "EW").replace("-", "")
+        file_id = clean_device_id.replace("EW-", "EW").replace("-", "")
         file_name = f"assessment_{file_id}.json"
 
         inbound_transfer = None
@@ -686,27 +760,42 @@ def receive_assessment():
             inbound_transfer.timestamp = now
             inbound_transfer.time = f"Today, {now.strftime('%I:%M %p')}"
 
+        current_app.logger.info(
+            "[ASSESSMENT_CALLBACK_STAGE_7] Transfer audit prepared | transfer_id=%s, device_id=%s, status=%s",
+            transfer_id, clean_device_id, inbound_transfer.status
+        )
+
+        failure_stage = "database_commit"
+        current_app.logger.info(
+            "[ASSESSMENT_CALLBACK_STAGE_6] Executing primary database commit | device_id=%s, transfer_id=%s",
+            clean_device_id, transfer_id
+        )
+
         try:
             db.session.commit()
+            current_app.logger.info(
+                "[ASSESSMENT_CALLBACK_STAGE_6] Primary database commit succeeded | device_id=%s, transfer_id=%s, device_status=%s",
+                clean_device_id, transfer_id, device.status
+            )
         except Exception as commit_err:
             db.session.rollback()
             current_app.logger.warning(
-                "Assessment commit attempt with float scores failed (%s: %s). Coercing scores to integer for PostgreSQL schema compatibility.",
-                type(commit_err).__name__, commit_err
+                "[ASSESSMENT_CALLBACK_STAGE_6] Primary commit failed (%s: %s). Activating integer score coercion fallback for schema compatibility.",
+                type(commit_err).__name__, commit_err, exc_info=True
             )
             # Re-fetch records after rollback
-            device = Device.query.filter_by(id=str(device_id).strip()).first()
-            assessment = AssessmentResult.query.filter_by(device_id=device_id).first()
+            device = Device.query.filter_by(id=clean_device_id).first()
+            assessment = AssessmentResult.query.filter_by(device_id=clean_device_id).first()
             if not assessment:
-                assessment = AssessmentResult(device_id=device_id)
+                assessment = AssessmentResult(device_id=clean_device_id)
                 db.session.add(assessment)
 
             assessment.repairability_score = int(round(repairability))
             assessment.circular_recovery_score = int(round(recovery_score))
-            assessment.repair_cost = repair_cost
-            assessment.component_value = component_val
+            assessment.repair_cost = float(repair_cost)
+            assessment.component_value = float(component_val)
             assessment.recommendation = canonical_rec
-            assessment.co2_avoided_kg = co2_avoided
+            assessment.co2_avoided_kg = float(co2_avoided)
             assessment.assessed_by = assessed_by
             assessment.notes = notes
             assessment.factors = factors_str
@@ -725,7 +814,7 @@ def receive_assessment():
                 transfer_id = f"TRF-{secrets.token_hex(4).upper()}"
                 inbound_transfer = Transfer(
                     id=transfer_id,
-                    device_id=device.id if device else device_id,
+                    device_id=device.id if device else clean_device_id,
                     file=file_name,
                     sender="Refurbishment",
                     receiver="Collection",
@@ -749,18 +838,16 @@ def receive_assessment():
                 inbound_transfer.time = f"Today, {now.strftime('%I:%M %p')}"
 
             db.session.commit()
-
-        current_app.logger.info(
-            "Assessment result successfully persisted | device_id=%s, transfer_id=%s, new_status=%s",
-            device.id, transfer_id, device.status,
-        )
+            current_app.logger.info(
+                "[ASSESSMENT_CALLBACK_STAGE_6] Fallback database commit succeeded | device_id=%s, transfer_id=%s, device_status=%s",
+                clean_device_id, transfer_id, device.status
+            )
 
     except Exception as e:
         db.session.rollback()
         current_app.logger.error(
-            "Transaction failed during assessment processing | device_id=%s, idempotency_key=%s, stage=%s, exception_type=%s, error=%s",
-            device_id,
-            idempotency_key,
+            "[ASSESSMENT_CALLBACK_ERROR] Unhandled exception during assessment processing | device_id=%s, stage=%s, exception_type=%s, error_message=%s",
+            clean_device_id,
             failure_stage,
             type(e).__name__,
             str(e),
@@ -769,8 +856,13 @@ def receive_assessment():
         return jsonify({
             "success": False,
             "error": "Internal Error",
-            "message": f"Failed to process assessment result: {type(e).__name__}"
+            "message": f"Failed to process assessment result: {type(e).__name__} - {str(e)}"
         }), 500
+
+    current_app.logger.info(
+        "[ASSESSMENT_CALLBACK_STAGE_8] Returning final HTTP 200 response | device_id=%s, transfer_id=%s, new_status=%s",
+        clean_device_id, transfer_id, device.status
+    )
 
     return jsonify({
         "success": True,

@@ -181,3 +181,77 @@ def test_unauthorized_callback_rejected(client):
     )
     assert resp2.status_code == 401
     assert resp2.get_json()["error"] == "Unauthorized"
+
+
+def test_hp_omen_callback_with_formatted_strings(client):
+    """Test callback delivery when partner or proxy passes formatted strings (currency, units)."""
+    payload = {
+        "device_id": DEVICE_ID,
+        "assessment_id": "ASM-TEST-FORMATTED",
+        "repairability_score": "59.5/100",
+        "circular_recovery_score": "59.5",
+        "repair_cost": "₹6,600",
+        "estimated_repair_cost": "6,600",
+        "component_value": "₹9,700",
+        "component_recovery_value": "9,700",
+        "estimated_refurbished_value": "₹14,000",
+        "co2_avoided_kg": "4.3 kg CO2 avoided",
+        "environmental_benefit": "4.3 kg",
+        "recommended_action": "PARTS RECOVERY",
+        "notes": "Cost of repair exceeds target threshold. Harvest valuable internal components.",
+    }
+    headers = {
+        "X-API-Key": "test-circular-api-key-2026",
+        "Idempotency-Key": "ASM-TEST-FORMATTED",
+        "Content-Type": "application/json",
+    }
+    resp = client.post("/api/v1/assessment-results", headers=headers, json=payload)
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["success"] is True
+    assert data["assessment"]["repairability_score"] == 59.5
+    assert data["assessment"]["repair_cost"] == 6600.0
+    assert data["assessment"]["component_value"] == 9700.0
+    assert data["assessment"]["co2_avoided_kg"] == 4.3
+
+
+def test_assessment_persists_and_reflects_in_reports_and_metrics(client, app):
+    """Test that assessment results reflect in platform metrics and reports."""
+    from metrics import get_platform_metrics
+    from reports import generate_assessment_pdf
+
+    payload = {
+        "device_id": DEVICE_ID,
+        "assessment_id": "ASM-TEST-METRICS",
+        "repairability_score": 59.5,
+        "circular_recovery_score": 59.5,
+        "repair_cost": 6600.0,
+        "component_value": 9700.0,
+        "co2_avoided_kg": 4.3,
+        "recommended_action": "PARTS RECOVERY",
+        "notes": "Enterprise gaming laptop evaluated for parts recovery.",
+    }
+    headers = {
+        "X-API-Key": "test-circular-api-key-2026",
+        "Idempotency-Key": "ASM-TEST-METRICS",
+        "Content-Type": "application/json",
+    }
+    resp = client.post("/api/v1/assessment-results", headers=headers, json=payload)
+    assert resp.status_code == 200
+
+    with app.app_context():
+        # Check platform metrics
+        metrics = get_platform_metrics()
+        assert metrics["parts_recovery"] >= 1
+        assert metrics["total_recovery_value"] >= 9700.0
+        assert metrics["total_co2_kg"] >= 4.3
+
+        # Check technical assessment PDF report generation
+        dev = Device.query.filter_by(id=DEVICE_ID).first()
+        asmt = AssessmentResult.query.filter_by(device_id=DEVICE_ID).first()
+        assert dev is not None
+        assert asmt is not None
+
+        pdf_bytes = generate_assessment_pdf(dev.to_dict(), asmt.to_dict())
+        assert len(pdf_bytes) > 500
+        assert pdf_bytes.startswith(b"%PDF")
