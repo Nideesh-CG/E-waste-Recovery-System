@@ -5,12 +5,14 @@ Provides authenticated endpoints for devices, transfers, partner assessments, an
 import io
 import json
 import math
+import os
 import secrets
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Tuple
 import requests
 from flask import Blueprint, current_app, has_request_context, jsonify, request, send_file, session
+from sqlalchemy import text
 from models import AssessmentResult, Device, DeviceFile, Transfer, db
 from storage import get_storage_service
 
@@ -493,7 +495,13 @@ def get_transfer(transfer_id):
     return jsonify(transfer.to_dict()), 200
 
 
-def extract_numeric(val, field_name: str, min_val: float = None, max_val: float = None, default=None):
+def extract_numeric(
+    val,
+    field_name: str,
+    min_val: Optional[float] = None,
+    max_val: Optional[float] = None,
+    default: Optional[float] = None,
+) -> Optional[float]:
     """Safely parse numbers from floats, ints, or formatted strings (currency, commas, units)."""
     if val is None or val == "":
         return default
@@ -558,15 +566,16 @@ def receive_assessment():
         current_app.logger.warning("[ASSESSMENT_CALLBACK_STAGE_1] Empty or non-dict JSON body")
         return jsonify({"error": "Bad Request", "message": "Empty or malformed JSON payload"}), 400
 
-    asmt_sub = data.get("assessment") if isinstance(data.get("assessment"), dict) else {}
+    body_data = data
+    asmt_sub = body_data.get("assessment") if isinstance(body_data.get("assessment"), dict) else {}
 
     def get_field(*keys):
         """Helper to extract field from top-level payload or nested assessment dict."""
         for k in keys:
-            if k in data and data[k] is not None:
-                return data[k]
-            if k in asmt_sub and asmt_sub[k] is not None:
-                return asmt_sub[k]
+            if isinstance(body_data, dict) and body_data.get(k) is not None:
+                return body_data.get(k)
+            if isinstance(asmt_sub, dict) and asmt_sub.get(k) is not None:
+                return asmt_sub.get(k)
         return None
 
     # 1. Check idempotency key (header or payload)
@@ -609,8 +618,9 @@ def receive_assessment():
 
     # 2. Check device existence (top-level, nested assessment, or nested device dict)
     device_id = get_field("device_id", "id")
-    if not device_id and isinstance(data.get("device"), dict):
-        device_id = data["device"].get("id") or data["device"].get("device_id")
+    device_obj = data.get("device") if isinstance(data, dict) else None
+    if not device_id and isinstance(device_obj, dict):
+        device_id = device_obj.get("id") or device_obj.get("device_id")
     if not device_id:
         current_app.logger.warning("[ASSESSMENT_CALLBACK_STAGE_3] Validation failure: device_id is missing")
         return jsonify({"error": "Validation Error", "message": "device_id is required"}), 400
@@ -1155,9 +1165,10 @@ def get_private_file(storage_key):
     storage = get_storage_service(current_app.config)
 
     # If short-lived signed URL is requested and supported by storage backend
-    if request.args.get("signed") == "true" and hasattr(storage, "create_signed_url"):
+    create_signed_url_fn = getattr(storage, "create_signed_url", None)
+    if request.args.get("signed") == "true" and callable(create_signed_url_fn):
         try:
-            signed_url = storage.create_signed_url(d_file.storage_key, expires_in=3600)
+            signed_url = create_signed_url_fn(d_file.storage_key, expires_in=3600)
             return jsonify({
                 "storage_key": d_file.storage_key,
                 "signed_url": signed_url,
