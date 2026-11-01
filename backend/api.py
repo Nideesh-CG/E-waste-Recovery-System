@@ -433,22 +433,30 @@ def receive_assessment():
         request.headers.get("Idempotency-Key") or
         request.headers.get("X-Idempotency-Key") or
         data.get("idempotency_key") or
+        data.get("assessment_id") or
         data.get("event_id")
     )
-    if idempotency_key:
+    is_force = bool(
+        request.headers.get("X-Force-Update")
+        or data.get("force_resend")
+        or data.get("force")
+        or data.get("retry")
+    )
+    if idempotency_key and not is_force:
         existing_transfer = Transfer.query.filter_by(idempotency_key=str(idempotency_key)).first()
         if existing_transfer:
             existing_dev = Device.query.filter_by(id=existing_transfer.device_id).first()
             existing_asmt = existing_dev.assessment if existing_dev else None
-            return jsonify({
-                "status": "success",
-                "idempotent": True,
-                "message": "Assessment result already processed (idempotent response)",
-                "transfer_id": existing_transfer.id,
-                "device_id": existing_transfer.device_id,
-                "new_device_status": existing_dev.status if existing_dev else "Completed",
-                "assessment": existing_asmt.to_dict() if existing_asmt else None
-            }), 200
+            if existing_asmt:
+                return jsonify({
+                    "status": "success",
+                    "idempotent": True,
+                    "message": "Assessment result already processed (idempotent response)",
+                    "transfer_id": existing_transfer.id,
+                    "device_id": existing_transfer.device_id,
+                    "new_device_status": existing_dev.status if existing_dev else "Completed",
+                    "assessment": existing_asmt.to_dict()
+                }), 200
 
     # 2. Check device existence first
     device_id = data.get("device_id")
@@ -487,10 +495,12 @@ def receive_assessment():
         else:
             recovery_score = None
 
-        if "repair_cost" in data and data["repair_cost"] is not None:
-            if isinstance(data["repair_cost"], bool):
+        # Accept repair_cost or estimated_repair_cost
+        rc_raw = data.get("repair_cost") if "repair_cost" in data else data.get("estimated_repair_cost")
+        if rc_raw is not None:
+            if isinstance(rc_raw, bool):
                 return jsonify({"error": "Validation Error", "message": "repair_cost must be finite and >= 0"}), 400
-            repair_cost = float(data["repair_cost"])
+            repair_cost = float(rc_raw)
             if not math.isfinite(repair_cost) or repair_cost < 0:
                 return jsonify({"error": "Validation Error", "message": "repair_cost must be finite and >= 0"}), 400
         else:
@@ -507,10 +517,12 @@ def receive_assessment():
         else:
             component_val = None
 
-        if "co2_avoided_kg" in data and data["co2_avoided_kg"] is not None:
-            if isinstance(data["co2_avoided_kg"], bool):
+        # Accept co2_avoided_kg or environmental_benefit
+        co2_raw = data.get("co2_avoided_kg") if "co2_avoided_kg" in data else data.get("environmental_benefit")
+        if co2_raw is not None:
+            if isinstance(co2_raw, bool):
                 return jsonify({"error": "Validation Error", "message": "co2_avoided_kg must be finite and >= 0"}), 400
-            co2_avoided = float(data["co2_avoided_kg"])
+            co2_avoided = float(co2_raw)
             if not math.isfinite(co2_avoided) or co2_avoided < 0:
                 return jsonify({"error": "Validation Error", "message": "co2_avoided_kg must be finite and >= 0"}), 400
         else:
@@ -520,13 +532,14 @@ def receive_assessment():
         return jsonify({"error": "Validation Error", "message": f"Invalid numeric field value: {err}"}), 400
 
     # 4. Required field presence validation - NO fabricated defaults
+    rec_val = data.get("recommendation") or data.get("recommended_action")
     if (
         repairability is None
         or recovery_score is None
         or repair_cost is None
         or component_val is None
         or co2_avoided is None
-        or not data.get("recommendation")
+        or not rec_val
     ):
         return jsonify({
             "error": "Validation Error",
@@ -534,7 +547,7 @@ def receive_assessment():
         }), 400
 
     # 5. Recommendation validation & canonical mapping
-    raw_rec = str(data["recommendation"]).strip()
+    raw_rec = str(rec_val).strip()
     rec_clean = raw_rec.upper().replace("-", "_")
     if rec_clean in RECOMMENDATION_ALIASES:
         canonical_rec = RECOMMENDATION_ALIASES[rec_clean]
@@ -550,7 +563,7 @@ def receive_assessment():
 
     # 6. String length limits
     assessed_by = str(data.get("assessed_by", "GreenTech Refurbishment Partner")).strip()[:128]
-    notes = str(data.get("notes", "")).strip()[:2000]
+    notes = str(data.get("notes") or data.get("technical_summary") or "").strip()[:2000]
 
     factors_raw = data.get("factors")
     if isinstance(factors_raw, list):
@@ -606,31 +619,111 @@ def receive_assessment():
         assessment.assessed_at = datetime.now(timezone.utc)
 
         # Update device status
-        device.transition_to(new_status)
+        if device.status == "Processing" or device.can_transition_to(new_status):
+            device.transition_to(new_status)
+        else:
+            device.status = new_status
 
-        # Log inbound transfer with idempotency key
+        # Log inbound transfer with idempotency key (upsert to avoid unique constraint violations)
         now = datetime.now(timezone.utc)
-        transfer_id = f"TRF-{secrets.token_hex(4).upper()}"
         file_id = device_id.replace("EW-", "EW").replace("-", "")
         file_name = f"assessment_{file_id}.json"
 
-        inbound_transfer = Transfer(
-            id=transfer_id,
-            device_id=device.id,
-            file=file_name,
-            sender="Refurbishment",
-            receiver="Collection",
-            status="Completed",
-            time=f"Today, {now.strftime('%I:%M %p')}",
-            timestamp=now,
-            http_status="200 OK",
-            response_body="Assessment intelligence received and processed successfully.",
-            endpoint="POST /api/v1/assessment-results",
-            payload=json.dumps(data),
-            idempotency_key=str(idempotency_key) if idempotency_key else None
-        )
-        db.session.add(inbound_transfer)
-        db.session.commit()
+        inbound_transfer = None
+        if idempotency_key:
+            inbound_transfer = Transfer.query.filter_by(idempotency_key=str(idempotency_key)).first()
+
+        if not inbound_transfer:
+            transfer_id = f"TRF-{secrets.token_hex(4).upper()}"
+            inbound_transfer = Transfer(
+                id=transfer_id,
+                device_id=device.id,
+                file=file_name,
+                sender="Refurbishment",
+                receiver="Collection",
+                status="Completed",
+                time=f"Today, {now.strftime('%I:%M %p')}",
+                timestamp=now,
+                http_status="200 OK",
+                response_body="Assessment intelligence received and processed successfully.",
+                endpoint="POST /api/v1/assessment-results",
+                payload=json.dumps(data),
+                idempotency_key=str(idempotency_key) if idempotency_key else None
+            )
+            db.session.add(inbound_transfer)
+        else:
+            transfer_id = inbound_transfer.id
+            inbound_transfer.status = "Completed"
+            inbound_transfer.http_status = "200 OK"
+            inbound_transfer.response_body = "Assessment intelligence received and processed successfully."
+            inbound_transfer.payload = json.dumps(data)
+            inbound_transfer.timestamp = now
+            inbound_transfer.time = f"Today, {now.strftime('%I:%M %p')}"
+
+        try:
+            db.session.commit()
+        except Exception as commit_err:
+            db.session.rollback()
+            current_app.logger.warning(
+                "Assessment commit attempt with float scores failed (%s: %s). Coercing scores to integer for PostgreSQL schema compatibility.",
+                type(commit_err).__name__, commit_err
+            )
+            # Re-fetch records after rollback
+            device = Device.query.filter_by(id=str(device_id).strip()).first()
+            assessment = AssessmentResult.query.filter_by(device_id=device_id).first()
+            if not assessment:
+                assessment = AssessmentResult(device_id=device_id)
+                db.session.add(assessment)
+
+            assessment.repairability_score = int(round(repairability))
+            assessment.circular_recovery_score = int(round(recovery_score))
+            assessment.repair_cost = repair_cost
+            assessment.component_value = component_val
+            assessment.recommendation = canonical_rec
+            assessment.co2_avoided_kg = co2_avoided
+            assessment.assessed_by = assessed_by
+            assessment.notes = notes
+            assessment.factors = factors_str
+            assessment.assessed_at = datetime.now(timezone.utc)
+
+            if device:
+                if device.status == "Processing" or device.can_transition_to(new_status):
+                    device.transition_to(new_status)
+                else:
+                    device.status = new_status
+
+            inbound_transfer = None
+            if idempotency_key:
+                inbound_transfer = Transfer.query.filter_by(idempotency_key=str(idempotency_key)).first()
+            if not inbound_transfer:
+                transfer_id = f"TRF-{secrets.token_hex(4).upper()}"
+                inbound_transfer = Transfer(
+                    id=transfer_id,
+                    device_id=device.id if device else device_id,
+                    file=file_name,
+                    sender="Refurbishment",
+                    receiver="Collection",
+                    status="Completed",
+                    time=f"Today, {now.strftime('%I:%M %p')}",
+                    timestamp=now,
+                    http_status="200 OK",
+                    response_body="Assessment intelligence received and processed successfully.",
+                    endpoint="POST /api/v1/assessment-results",
+                    payload=json.dumps(data),
+                    idempotency_key=str(idempotency_key) if idempotency_key else None
+                )
+                db.session.add(inbound_transfer)
+            else:
+                transfer_id = inbound_transfer.id
+                inbound_transfer.status = "Completed"
+                inbound_transfer.http_status = "200 OK"
+                inbound_transfer.response_body = "Assessment intelligence received and processed successfully."
+                inbound_transfer.payload = json.dumps(data)
+                inbound_transfer.timestamp = now
+                inbound_transfer.time = f"Today, {now.strftime('%I:%M %p')}"
+
+            db.session.commit()
+
         current_app.logger.info(
             "Assessment result successfully persisted | device_id=%s, transfer_id=%s, new_status=%s",
             device.id, transfer_id, device.status,

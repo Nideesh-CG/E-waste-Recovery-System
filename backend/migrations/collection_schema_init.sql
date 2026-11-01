@@ -110,8 +110,8 @@ CREATE TABLE IF NOT EXISTS collection.transfers (
 CREATE TABLE IF NOT EXISTS collection.assessment_results (
     id SERIAL PRIMARY KEY,
     device_id VARCHAR(64) NOT NULL UNIQUE REFERENCES collection.devices(id) ON DELETE CASCADE,
-    repairability_score INTEGER NOT NULL,
-    circular_recovery_score INTEGER NOT NULL,
+    repairability_score DOUBLE PRECISION NOT NULL,
+    circular_recovery_score DOUBLE PRECISION NOT NULL,
     repair_cost DOUBLE PRECISION NOT NULL,
     component_value DOUBLE PRECISION NOT NULL,
     recommendation VARCHAR(64) NOT NULL,
@@ -237,6 +237,8 @@ BEGIN
         ALTER TABLE collection.assessment_results ALTER COLUMN device_id TYPE VARCHAR(64);
         ALTER TABLE collection.assessment_results ALTER COLUMN assessed_by TYPE VARCHAR(128);
         ALTER TABLE collection.assessment_results ALTER COLUMN recommendation TYPE VARCHAR(64);
+        ALTER TABLE collection.assessment_results ALTER COLUMN repairability_score TYPE DOUBLE PRECISION;
+        ALTER TABLE collection.assessment_results ALTER COLUMN circular_recovery_score TYPE DOUBLE PRECISION;
     END IF;
 
     -- -------------------------------------------------------------------------

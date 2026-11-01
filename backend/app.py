@@ -256,6 +256,21 @@ def create_app(database=None, config_class=None):
                 # In production, do not call db.create_all() automatically; schema must be managed via migrations
                 try:
                     inspector = inspect(db.engine)
+                    # Non-destructively reconcile score columns to DOUBLE PRECISION in PostgreSQL
+                    if "sqlite" not in str(app.config.get("SQLALCHEMY_DATABASE_URI", "")):
+                        try:
+                            from sqlalchemy import text
+                            db.session.execute(text(
+                                "DO $$ BEGIN "
+                                "IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'collection' AND table_name = 'assessment_results') THEN "
+                                "  BEGIN ALTER TABLE collection.assessment_results ALTER COLUMN repairability_score TYPE DOUBLE PRECISION; EXCEPTION WHEN OTHERS THEN NULL; END; "
+                                "  BEGIN ALTER TABLE collection.assessment_results ALTER COLUMN circular_recovery_score TYPE DOUBLE PRECISION; EXCEPTION WHEN OTHERS THEN NULL; END; "
+                                "END IF; "
+                                "END $$;"
+                            ))
+                            db.session.commit()
+                        except Exception:
+                            db.session.rollback()
                 except Exception as exc:
                     app.logger.warning("Production database schema check warning: %s", exc)
 
