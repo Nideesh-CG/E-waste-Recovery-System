@@ -62,7 +62,7 @@ def get_platform_metrics(period: Optional[str] = None) -> Dict[str, Any]:
         # Diverted weight in kg: sum weights of devices that have entered the recovery pipeline
         # Requirement: Do not count Pending Assessment devices as diverted e-waste.
         # Use statuses: Processing, Refurbishment, Parts recovery, Completed
-        diverted_devices = dev_q.filter(Device.status.in_(DIVERTED_STATUSES)).all()
+        diverted_devices = dev_q.filter(getattr(Device, "status").in_(DIVERTED_STATUSES)).all()
         total_weight = 0.0
         for dev in diverted_devices:
             try:

@@ -170,93 +170,46 @@ class Config:
     @classmethod
     def validate_production_config(cls, conf=None):
         """Validate critical secrets in production to fail fast and fail secure."""
-        target = conf if conf is not None else cls
-        is_prod = (
-            target.get("IS_PRODUCTION", False)
-            if hasattr(target, "get")
-            else getattr(target, "IS_PRODUCTION", False)
-        )
+        def get_val(key, default=None):
+            if conf is not None:
+                if hasattr(conf, "get"):
+                    return conf.get(key, default)
+                return getattr(conf, key, default)
+            return getattr(cls, key, default)
+
+        is_prod = bool(get_val("IS_PRODUCTION", False))
         if is_prod:
-            secret = (
-                target.get("SECRET_KEY")
-                if hasattr(target, "get")
-                else getattr(target, "SECRET_KEY", None)
-            )
-            circular_secret = (
-                target.get("CIRCULAR_SECRET_KEY")
-                if hasattr(target, "get")
-                else getattr(target, "CIRCULAR_SECRET_KEY", None)
-            )
+            secret = get_val("SECRET_KEY")
+            circular_secret = get_val("CIRCULAR_SECRET_KEY")
             effective_secret = circular_secret or secret
             if not effective_secret or effective_secret in (
                 "dev-secret-key-replace-in-production",
                 "circular-default-production-session-secret-key-32b",
             ):
                 raise ValueError("SECRET_KEY (or CIRCULAR_SECRET_KEY) must be explicitly configured in production.")
-            circular_key = (
-                target.get("CIRCULAR_API_KEY")
-                if hasattr(target, "get")
-                else getattr(target, "CIRCULAR_API_KEY", None)
-            )
+            circular_key = get_val("CIRCULAR_API_KEY") or get_val("COLLECTION_API_KEY")
             if not circular_key:
-                raise ValueError("CIRCULAR_API_KEY must be configured in production.")
+                raise ValueError("CIRCULAR_API_KEY (or COLLECTION_API_KEY) must be configured in production.")
 
-            partner_key = (
-                target.get("PARTNER_API_KEY")
-                if hasattr(target, "get")
-                else getattr(target, "PARTNER_API_KEY", None)
-            )
+            partner_key = get_val("PARTNER_API_KEY")
             if not partner_key:
                 raise ValueError("PARTNER_API_KEY must be configured in production.")
 
             if circular_key == partner_key:
                 raise ValueError("CIRCULAR_API_KEY and PARTNER_API_KEY must be distinct credentials.")
 
-            storage_prov = (
-                target.get("STORAGE_PROVIDER")
-                if hasattr(target, "get")
-                else getattr(target, "STORAGE_PROVIDER", "")
-            )
-            sub_url = (
-                target.get("SUPABASE_URL")
-                if hasattr(target, "get")
-                else getattr(target, "SUPABASE_URL", "")
-            )
-            sub_key = (
-                target.get("SUPABASE_SERVICE_ROLE_KEY")
-                if hasattr(target, "get")
-                else getattr(target, "SUPABASE_SERVICE_ROLE_KEY", "")
-            ) or (
-                target.get("SUPABASE_KEY")
-                if hasattr(target, "get")
-                else getattr(target, "SUPABASE_KEY", "")
-            )
-            testing = (
-                target.get("TESTING", False)
-                if hasattr(target, "get")
-                else getattr(target, "TESTING", False)
-            )
+            storage_prov = get_val("STORAGE_PROVIDER", "")
+            sub_url = get_val("SUPABASE_URL", "")
+            sub_key = get_val("SUPABASE_SERVICE_ROLE_KEY", "") or get_val("SUPABASE_KEY", "")
+            testing = bool(get_val("TESTING", False))
             if not testing:
                 if str(storage_prov).lower() != "supabase" or not sub_url or not sub_key:
                     raise ValueError(
                         "In production, STORAGE_PROVIDER must be 'supabase' and SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be configured. Local filesystem storage fallback is disallowed."
                     )
 
-            db_uri = (
-                target.get("SQLALCHEMY_DATABASE_URI")
-                if hasattr(target, "get")
-                else getattr(target, "SQLALCHEMY_DATABASE_URI", None)
-            )
-            testing = (
-                target.get("TESTING", False)
-                if hasattr(target, "get")
-                else getattr(target, "TESTING", False)
-            )
-            testing_db = (
-                target.get("TESTING_DATABASE", False)
-                if hasattr(target, "get")
-                else getattr(target, "TESTING_DATABASE", False)
-            )
+            db_uri = get_val("SQLALCHEMY_DATABASE_URI")
+            testing_db = bool(get_val("TESTING_DATABASE", False))
             if not testing and not testing_db and db_uri is not None:
                 if not db_uri or (str(db_uri).startswith("sqlite") and ":memory:" not in str(db_uri)):
                     raise ValueError("PostgreSQL DATABASE_URL (Supabase) must be configured in production. SQLite is not allowed in production.")

@@ -63,14 +63,24 @@ DEMO_PATH = (
     if (BACKEND_DIR / "demo.json").exists()
     else FRONTEND_DIR / "demo.json"
 )
-DEMO = json.loads(DEMO_PATH.read_text(encoding="utf-8"))
+DEMO = {"devices": [], "transfers": []}
+if DEMO_PATH.exists():
+    try:
+        DEMO = json.loads(DEMO_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        DEMO = {"devices": [], "transfers": []}
 
 ICONS_PATH = (
     STATIC_DIR / "icons.json"
     if (STATIC_DIR / "icons.json").exists()
     else BACKEND_DIR / "static/icons.json"
 )
-ICONS = json.loads(ICONS_PATH.read_text(encoding="utf-8"))
+ICONS = {}
+if ICONS_PATH.exists():
+    try:
+        ICONS = json.loads(ICONS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        ICONS = {}
 
 migrate = Migrate()
 
@@ -152,15 +162,18 @@ def create_app(database=None, config_class=None):
     runtime_secret = os.environ.get("CIRCULAR_SECRET_KEY") or os.environ.get("SECRET_KEY")
     if runtime_secret:
         app.config["SECRET_KEY"] = runtime_secret
-    runtime_api_key = os.environ.get("CIRCULAR_API_KEY")
-    if runtime_api_key:
-        app.config["CIRCULAR_API_KEY"] = runtime_api_key
+    effective_inbound_key = (
+        os.environ.get("COLLECTION_API_KEY")
+        or os.environ.get("CIRCULAR_API_KEY")
+        or app.config.get("COLLECTION_API_KEY")
+        or app.config.get("CIRCULAR_API_KEY")
+    )
+    if effective_inbound_key:
+        app.config["CIRCULAR_API_KEY"] = effective_inbound_key
+        app.config["COLLECTION_API_KEY"] = effective_inbound_key
     runtime_partner_key = os.environ.get("PARTNER_API_KEY")
     if runtime_partner_key:
         app.config["PARTNER_API_KEY"] = runtime_partner_key
-    runtime_collection_key = os.environ.get("COLLECTION_API_KEY")
-    if runtime_collection_key:
-        app.config["COLLECTION_API_KEY"] = runtime_collection_key
     runtime_admin_key = os.environ.get("ADMIN_API_KEY")
     if runtime_admin_key:
         app.config["ADMIN_API_KEY"] = runtime_admin_key
@@ -1101,6 +1114,7 @@ def create_app(database=None, config_class=None):
                                 btn["class"] = "rounded-xl border px-4 py-5 text-center text-xs border-[#e7ece2] text-[#9ba792]".split()
 
         if page == "transfers":
+            current_filter = request.args.get("filter", "All transfers")
             tbody = main.select_one("tbody")
             if tbody and tbody.select_one("tr"):
                 prototype = deepcopy(tbody.select_one("tr"))
