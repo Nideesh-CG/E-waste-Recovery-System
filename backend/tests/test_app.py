@@ -1819,7 +1819,6 @@ class CircularTests(unittest.TestCase):
         invalid_cases = [
             ("repairability_score", 101),
             ("repairability_score", -1),
-            ("repairability_score", 85.5),
             ("repairability_score", True),
             ("repairability_score", "invalid_string"),
             ("circular_recovery_score", 150),
@@ -1842,6 +1841,13 @@ class CircularTests(unittest.TestCase):
             bad_payload[field_name] = bad_value
             res_bad = self.client.post("/api/v1/assessment-results", data=json.dumps(bad_payload), headers=headers)
             self.assertEqual(res_bad.status_code, 400, f"Expected 400 for {field_name}={bad_value}, got {res_bad.status_code}")
+
+        # Decimal score support test
+        decimal_payload = dict(base_valid)
+        decimal_payload["repairability_score"] = 85.5
+        decimal_payload["circular_recovery_score"] = 82.5
+        res_decimal = self.client.post("/api/v1/assessment-results", data=json.dumps(decimal_payload), headers=headers)
+        self.assertEqual(res_decimal.status_code, 200, "Decimal assessment scores must be accepted")
 
     def test_scenario_10_invalid_recommendation(self):
         """Scenario 10: Recommendation validation and canonical normalization.

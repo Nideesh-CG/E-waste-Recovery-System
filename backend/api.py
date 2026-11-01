@@ -463,27 +463,27 @@ def receive_assessment():
     try:
         if "repairability_score" in data and data["repairability_score"] is not None:
             if isinstance(data["repairability_score"], bool):
-                return jsonify({"error": "Validation Error", "message": "repairability_score must be an integer between 0 and 100"}), 400
+                return jsonify({"error": "Validation Error", "message": "repairability_score must be a number between 0 and 100"}), 400
             try:
                 r_val = float(data["repairability_score"])
             except (ValueError, TypeError):
-                return jsonify({"error": "Validation Error", "message": "repairability_score must be an integer between 0 and 100"}), 400
-            if not math.isfinite(r_val) or r_val != int(r_val) or not (0 <= r_val <= 100):
-                return jsonify({"error": "Validation Error", "message": "repairability_score must be an integer between 0 and 100"}), 400
-            repairability = int(r_val)
+                return jsonify({"error": "Validation Error", "message": "repairability_score must be a number between 0 and 100"}), 400
+            if not math.isfinite(r_val) or not (0 <= r_val <= 100):
+                return jsonify({"error": "Validation Error", "message": "repairability_score must be a number between 0 and 100"}), 400
+            repairability = round(r_val, 2)
         else:
             repairability = None
 
         if "circular_recovery_score" in data and data["circular_recovery_score"] is not None:
             if isinstance(data["circular_recovery_score"], bool):
-                return jsonify({"error": "Validation Error", "message": "circular_recovery_score must be an integer between 0 and 100"}), 400
+                return jsonify({"error": "Validation Error", "message": "circular_recovery_score must be a number between 0 and 100"}), 400
             try:
                 c_val = float(data["circular_recovery_score"])
             except (ValueError, TypeError):
-                return jsonify({"error": "Validation Error", "message": "circular_recovery_score must be an integer between 0 and 100"}), 400
-            if not math.isfinite(c_val) or c_val != int(c_val) or not (0 <= c_val <= 100):
-                return jsonify({"error": "Validation Error", "message": "circular_recovery_score must be an integer between 0 and 100"}), 400
-            recovery_score = int(c_val)
+                return jsonify({"error": "Validation Error", "message": "circular_recovery_score must be a number between 0 and 100"}), 400
+            if not math.isfinite(c_val) or not (0 <= c_val <= 100):
+                return jsonify({"error": "Validation Error", "message": "circular_recovery_score must be a number between 0 and 100"}), 400
+            recovery_score = round(c_val, 2)
         else:
             recovery_score = None
 

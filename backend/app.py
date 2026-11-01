@@ -1041,7 +1041,7 @@ def create_app(database=None, config_class=None):
                     replace_text(
                         main,
                         {
-                            "86 / 100": f"{asmt.repairability_score} / 100",
+                            "86 / 100": f"{asmt.repairability_score:g} / 100",
                             "₹7,100": f"₹{asmt.repair_cost:,.0f}",
                             "₹12,100": f"₹{asmt.component_value:,.0f}",
                             "18 kg CO₂": f"{asmt.co2_avoided_kg:g} kg CO₂",
@@ -1702,8 +1702,8 @@ def create_app(database=None, config_class=None):
             report = (
                 f"Verified Technical Assessment Report\n"
                 f"Device: {device.name} ({device.id})\n"
-                f"Repairability Score: {asmt.repairability_score}/100\n"
-                f"Circular Recovery Score: {asmt.circular_recovery_score}/100\n"
+                f"Repairability Score: {asmt.repairability_score:g}/100\n"
+                f"Circular Recovery Score: {asmt.circular_recovery_score:g}/100\n"
                 f"Repair Cost: ₹{asmt.repair_cost:,.0f}\n"
                 f"Component Recovery Value: ₹{asmt.component_value:,.0f}\n"
                 f"Recommendation: {asmt.recommendation}\n"

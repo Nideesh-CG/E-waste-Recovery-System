@@ -380,8 +380,8 @@ class AssessmentResult(db.Model):
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     device_id = db.Column(db.String(64), db.ForeignKey(f"{SCHEMA}.devices.id"), unique=True, nullable=False)
-    repairability_score = db.Column(db.Integer, nullable=False)
-    circular_recovery_score = db.Column(db.Integer, nullable=False)
+    repairability_score = db.Column(db.Float, nullable=False)
+    circular_recovery_score = db.Column(db.Float, nullable=False)
     repair_cost = db.Column(db.Float, nullable=False)
     component_value = db.Column(db.Float, nullable=False)
     recommendation = db.Column(db.String(64), nullable=False)

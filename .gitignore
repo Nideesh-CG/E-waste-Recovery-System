@@ -40,6 +40,8 @@ uploads/
 # Test coverage artifacts
 .coverage
 htmlcov/
+*.log
+backend/tests/*.log
 
 # OS generated files
 .DS_Store
