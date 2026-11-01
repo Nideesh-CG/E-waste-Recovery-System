@@ -144,6 +144,13 @@ class Config:
         or ("dev-circular-key" if not IS_PRODUCTION else "")
     )
 
+    # Privileged administrative API key
+    ADMIN_API_KEY = (
+        os.environ.get("ADMIN_API_KEY")
+        or os.environ.get("COLLECTION_ADMIN_API_KEY")
+        or ""
+    ).strip() or None
+
     # Demo data policy: in production default to False unless explicitly enabled
     SEED_DEMO_DATA = os.environ.get(
         "SEED_DEMO_DATA",

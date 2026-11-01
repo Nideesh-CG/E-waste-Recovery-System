@@ -158,6 +158,12 @@ def create_app(database=None, config_class=None):
     runtime_partner_key = os.environ.get("PARTNER_API_KEY")
     if runtime_partner_key:
         app.config["PARTNER_API_KEY"] = runtime_partner_key
+    runtime_collection_key = os.environ.get("COLLECTION_API_KEY")
+    if runtime_collection_key:
+        app.config["COLLECTION_API_KEY"] = runtime_collection_key
+    runtime_admin_key = os.environ.get("ADMIN_API_KEY")
+    if runtime_admin_key:
+        app.config["ADMIN_API_KEY"] = runtime_admin_key
 
     if database or config_class:
         app.config["TESTING_DATABASE"] = True

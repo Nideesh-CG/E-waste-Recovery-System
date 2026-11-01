@@ -40,12 +40,20 @@ def verify_api_key() -> bool:
     """Verify inbound API key against configuration.
     
     Strictly checks headers only; credentials from query parameters are prohibited.
+    Accepts valid inbound partner keys (COLLECTION_API_KEY, CIRCULAR_API_KEY) and ADMIN_API_KEY.
     """
-    expected_key = current_app.config.get("COLLECTION_API_KEY") or current_app.config.get("CIRCULAR_API_KEY")
+    valid_expected_keys = [
+        k for k in [
+            current_app.config.get("COLLECTION_API_KEY"),
+            current_app.config.get("CIRCULAR_API_KEY"),
+            current_app.config.get("ADMIN_API_KEY"),
+        ]
+        if k and str(k).strip()
+    ]
     is_prod = current_app.config.get("IS_PRODUCTION", False)
 
-    # In production or development, missing expected_key must fail
-    if not expected_key:
+    # In production or development, missing expected keys must fail
+    if not valid_expected_keys:
         current_app.logger.warning("Inbound API verification failed: COLLECTION_API_KEY / CIRCULAR_API_KEY not configured")
         return False
 
@@ -62,7 +70,11 @@ def verify_api_key() -> bool:
     if not provided_key:
         return False
 
-    return bool(secrets.compare_digest(provided_key, expected_key))
+    for exp_key in valid_expected_keys:
+        if secrets.compare_digest(provided_key, exp_key):
+            return True
+
+    return False
 
 
 @api_bp.before_request
@@ -449,11 +461,13 @@ def receive_assessment():
             existing_asmt = existing_dev.assessment if existing_dev else None
             if existing_asmt:
                 return jsonify({
+                    "success": True,
                     "status": "success",
                     "idempotent": True,
-                    "message": "Assessment result already processed (idempotent response)",
+                    "message": "Assessment received successfully",
                     "transfer_id": existing_transfer.id,
                     "device_id": existing_transfer.device_id,
+                    "assessment_id": data.get("assessment_id") or str(idempotency_key),
                     "new_device_status": existing_dev.status if existing_dev else "Completed",
                     "assessment": existing_asmt.to_dict()
                 }), 200
@@ -493,7 +507,7 @@ def receive_assessment():
                 return jsonify({"error": "Validation Error", "message": "circular_recovery_score must be a number between 0 and 100"}), 400
             recovery_score = round(c_val, 2)
         else:
-            recovery_score = None
+            recovery_score = repairability  # Default fallback if partner payload does not supply separate recovery score
 
         # Accept repair_cost or estimated_repair_cost
         rc_raw = data.get("repair_cost") if "repair_cost" in data else data.get("estimated_repair_cost")
@@ -565,13 +579,23 @@ def receive_assessment():
     assessed_by = str(data.get("assessed_by", "GreenTech Refurbishment Partner")).strip()[:128]
     notes = str(data.get("notes") or data.get("technical_summary") or "").strip()[:2000]
 
-    factors_raw = data.get("factors")
-    if isinstance(factors_raw, list):
+    factors_raw = data.get("factors") or data.get("reasons") or data.get("component_breakdown")
+    if isinstance(factors_raw, (list, dict)):
         factors_str = json.dumps(factors_raw)
     elif isinstance(factors_raw, str):
         factors_str = factors_raw[:2000]
     else:
         factors_str = None
+
+    assessed_at_raw = data.get("assessment_date") or data.get("assessed_at")
+    assessed_at_val = None
+    if assessed_at_raw:
+        try:
+            assessed_at_val = datetime.fromisoformat(str(assessed_at_raw).replace("Z", "+00:00"))
+        except Exception:
+            assessed_at_val = None
+    if not assessed_at_val:
+        assessed_at_val = datetime.now(timezone.utc)
 
     # 7. Determine new device status based on canonical recommendation
     if canonical_rec == "REFURBISH":
@@ -585,18 +609,20 @@ def receive_assessment():
         # Recommendation is recorded as 'REJECT' and device transitions to 'Completed' (triage conclusion).
         new_status = "Completed"
 
-    # Verify lifecycle prerequisites: device MUST be in 'Processing'
-    if device.status != "Processing":
+    # Verify lifecycle prerequisites: device MUST be in 'Processing' or already in target new_status (for idempotent retries/resends)
+    if device.status != "Processing" and device.status != new_status:
         return jsonify({
             "error": "Conflict",
             "message": f"Device {device_id} is in status '{device.status}' and cannot transition to '{new_status}'. Device must be in 'Processing' before assessment can be applied."
         }), 409
 
-    if not device.can_transition_to(new_status):
+    if device.status == "Processing" and not device.can_transition_to(new_status):
         return jsonify({
             "error": "Conflict",
             "message": f"Device {device_id} is in status '{device.status}' and cannot transition to '{new_status}'."
         }), 409
+
+    assessment_id_val = str(data.get("assessment_id") or f"ASM-{device.id}")
 
     # Transactional execution
     failure_stage = "assessment_persistence"
@@ -616,7 +642,7 @@ def receive_assessment():
         assessment.assessed_by = assessed_by
         assessment.notes = notes
         assessment.factors = factors_str
-        assessment.assessed_at = datetime.now(timezone.utc)
+        assessment.assessed_at = assessed_at_val
 
         # Update device status
         if device.status == "Processing" or device.can_transition_to(new_status):
@@ -684,7 +710,7 @@ def receive_assessment():
             assessment.assessed_by = assessed_by
             assessment.notes = notes
             assessment.factors = factors_str
-            assessment.assessed_at = datetime.now(timezone.utc)
+            assessment.assessed_at = assessed_at_val
 
             if device:
                 if device.status == "Processing" or device.can_transition_to(new_status):
@@ -740,13 +766,19 @@ def receive_assessment():
             str(e),
             exc_info=True,
         )
-        return jsonify({"error": "Internal Error", "message": f"Failed to process assessment result: {type(e).__name__}"}), 500
+        return jsonify({
+            "success": False,
+            "error": "Internal Error",
+            "message": f"Failed to process assessment result: {type(e).__name__}"
+        }), 500
 
     return jsonify({
+        "success": True,
         "status": "success",
-        "message": "Assessment result stored successfully",
-        "transfer_id": transfer_id,
+        "message": "Assessment received successfully",
         "device_id": device.id,
+        "assessment_id": assessment_id_val,
+        "transfer_id": transfer_id,
         "new_device_status": device.status,
         "assessment": assessment.to_dict()
     }), 200

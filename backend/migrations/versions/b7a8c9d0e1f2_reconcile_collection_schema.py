@@ -212,6 +212,11 @@ def upgrade():
             op.alter_column("assessment_results", "device_id", type_=sa.String(64), schema=target_schema)
             op.alter_column("assessment_results", "assessed_by", type_=sa.String(128), schema=target_schema)
             op.alter_column("assessment_results", "recommendation", type_=sa.String(64), schema=target_schema)
+            try:
+                op.execute("ALTER TABLE collection.assessment_results ALTER COLUMN repairability_score TYPE DOUBLE PRECISION USING repairability_score::double precision;")
+                op.execute("ALTER TABLE collection.assessment_results ALTER COLUMN circular_recovery_score TYPE DOUBLE PRECISION USING circular_recovery_score::double precision;")
+            except Exception:
+                pass
 
     # -------------------------------------------------------------------------
     # 4. DEVICE FILES TABLE
