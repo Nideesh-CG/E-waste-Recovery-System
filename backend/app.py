@@ -253,7 +253,11 @@ def create_app(database=None, config_class=None):
             if not is_production:
                 try:
                     inspector = inspect(db.engine)
-                    if not inspector.has_table("devices"):
+                    has_dev = (
+                        inspector.has_table("devices")
+                        or inspector.has_table("devices", schema="collection")
+                    )
+                    if not has_dev:
                         db.create_all()
                         inspector = inspect(db.engine)
                 except Exception as exc:
@@ -281,7 +285,16 @@ def create_app(database=None, config_class=None):
                     app.logger.warning("Production database schema check warning: %s", exc)
 
             # Only seed initial demo data if tables exist (e.g. after migration or in testing)
-            if inspector and inspector.has_table("devices") and inspector.has_table("metadata"):
+            has_devices = False
+            has_metadata = False
+            if inspector:
+                try:
+                    has_devices = inspector.has_table("devices") or inspector.has_table("devices", schema="collection")
+                    has_metadata = inspector.has_table("metadata") or inspector.has_table("metadata", schema="collection")
+                except Exception:
+                    pass
+
+            if has_devices and has_metadata:
                 should_seed = False if is_production else app.config.get("SEED_DEMO_DATA", True)
                 if should_seed and not Metadata.query.filter_by(key="seeded").first():
                     for record in DEMO["devices"]:
@@ -1611,7 +1624,12 @@ def create_app(database=None, config_class=None):
             )
             flash("Transfer queued for retry.")
 
-        db.session.commit()
+        try:
+            db.session.commit()
+        except Exception as exc:
+            db.session.rollback()
+            app.logger.error("Failed to commit transfer retry update: %s", exc)
+            flash("Database error saving transfer retry status.")
         return redirect("/transfers")
 
     @app.get("/assessment/<device_id>")
@@ -1642,7 +1660,11 @@ def create_app(database=None, config_class=None):
         if not all(c.isalnum() or c in "-_." for c in safe_name):
             abort(404)
 
-        d_file = DeviceFile.query.filter_by(storage_key=safe_name).first()
+        d_file = DeviceFile.query.filter(
+            (DeviceFile.storage_key == safe_name)
+            | (DeviceFile.filename == safe_name)
+            | (DeviceFile.storage_key.endswith("/" + safe_name))
+        ).first()
         if not d_file:
             abort(404)
         if d_file.is_private or d_file.file_type != "image":
@@ -1650,7 +1672,7 @@ def create_app(database=None, config_class=None):
 
         storage = get_storage_service(app.config)
         try:
-            file_bytes, content_type = storage.retrieve(safe_name)
+            file_bytes, content_type = storage.retrieve(d_file.storage_key)
             return send_file(
                 io.BytesIO(file_bytes),
                 mimetype=content_type or d_file.content_type or "application/octet-stream",
@@ -1740,7 +1762,7 @@ def create_app(database=None, config_class=None):
                 download_name=f"assessment-{device_id}.txt",
             )
 
-        pdf_bytes = generate_assessment_pdf(device, asmt_dict)
+        pdf_bytes = generate_assessment_pdf(device.to_dict() if hasattr(device, "to_dict") else device, asmt_dict)
         return send_file(
             io.BytesIO(pdf_bytes),
             mimetype="application/pdf",
