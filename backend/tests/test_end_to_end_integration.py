@@ -40,7 +40,7 @@ PARTNER_KEY = "partner-inbound-secret-test-key-2026"
 COLLECTION_KEY = "collection-inbound-secret-test-key-2026"
 
 COLLECTION_ROOT = Path(r"D:\E-waste-Recovery")
-REFURB_ROOT = Path(r"D:\circular-refurbishment-intelligence")
+REFURB_ROOT = Path(r"D:\python_lab") if (Path(r"D:\python_lab") / "wsgi.py").is_file() else Path(r"D:\circular-refurbishment-intelligence")
 
 
 class EndToEndIntegrationTests(unittest.TestCase):
@@ -55,10 +55,12 @@ class EndToEndIntegrationTests(unittest.TestCase):
             "PYTHONPATH": str(REFURB_ROOT / "backend"),
             "PORT": REFURB_PORT,
             "PARTNER_INBOUND_API_KEY": PARTNER_KEY,
+            "ADMIN_API_KEY": PARTNER_KEY,
             "COLLECTION_API_KEY": COLLECTION_KEY,
             "COLLECTION_API_URL": f"http://127.0.0.1:{COLLECTION_PORT}",
             "FLASK_ENV": "development",
             "SECRET_KEY": "refurb-test-secret-2026",
+            "DB_SCHEMA": "refurbishment",
         }
 
         collection_env = {

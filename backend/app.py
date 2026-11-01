@@ -92,6 +92,7 @@ def replace_text(node, mapping):
 def badge(node, status):
     colors = {
         "Failed": "bg-red-50 text-red-600",
+        "Retryable": "bg-amber-50 text-amber-700",
         "Pending": "bg-[#fff5df] text-[#a07829]",
         "Pending assessment": "bg-[#fff5df] text-[#a07829]",
         "Parts recovery": "bg-[#eef0ff] text-[#6870ac]",
@@ -1094,7 +1095,7 @@ def create_app(database=None, config_class=None):
                         link(buttons[0], "/transfers?selected=" + transfer["id"])
                         for b in buttons[1:]:
                             b.decompose()
-                    if transfer["status"] == "Failed":
+                    if transfer["status"] in ("Failed", "Retryable"):
                         retry = soup(
                             '<button class="text-[10px] text-[#467454]" type="button">Retry</button>'
                         ).button
@@ -1440,9 +1441,18 @@ def create_app(database=None, config_class=None):
                 transfer.timestamp = datetime.now(timezone.utc)
                 flash("Retry failed: PARTNER_API_KEY is not configured.")
             else:
-                target_endpoint = (
-                    transfer.endpoint or f"{partner_url}/api/v1/refurbishment/devices"
-                )
+                target_endpoint = transfer.endpoint
+                if not target_endpoint or not target_endpoint.startswith("http"):
+                    clean_partner_url = partner_url.rstrip("/")
+                    if clean_partner_url.endswith("/api/v1/refurbishment/devices"):
+                        target_endpoint = clean_partner_url
+                    elif clean_partner_url.endswith("/api/v1"):
+                        target_endpoint = f"{clean_partner_url}/refurbishment/devices"
+                    elif clean_partner_url.endswith("/api"):
+                        target_endpoint = f"{clean_partner_url}/v1/refurbishment/devices"
+                    else:
+                        target_endpoint = f"{clean_partner_url}/api/v1/refurbishment/devices"
+
                 headers = {
                     "Content-Type": "application/json",
                     "X-API-Key": partner_key,
@@ -1483,36 +1493,93 @@ def create_app(database=None, config_class=None):
                     transfer.response_body = resp.text[:2000]
                     transfer.retry_count = (transfer.retry_count or 0) + 1
                     transfer.timestamp = datetime.now(timezone.utc)
+
+                    is_html = (
+                        transfer.response_body.strip().startswith("<!doctype html")
+                        or transfer.response_body.strip().startswith("<html")
+                        or "<html" in transfer.response_body[:200].lower()
+                    )
+                    raw_ct = ""
+                    if hasattr(resp, "headers") and hasattr(resp.headers, "get"):
+                        raw_ct = resp.headers.get("Content-Type", "")
+                    if isinstance(raw_ct, str) and "text/html" in raw_ct.lower():
+                        is_html = True
+
+                    resp_json = None
+                    if not is_html:
+                        try:
+                            parsed = resp.json()
+                            if isinstance(parsed, dict):
+                                resp_json = parsed
+                        except Exception:
+                            pass
+                        if resp_json is None and transfer.response_body:
+                            try:
+                                parsed = json.loads(transfer.response_body)
+                                if isinstance(parsed, dict):
+                                    resp_json = parsed
+                            except Exception:
+                                resp_json = None
+
                     if resp.status_code in (200, 201):
-                        transfer.status = "Completed"
-                        if device and device.status == "Pending assessment":
-                            device.transition_to("Processing")
-                        flash("Transfer retry succeeded.")
+                        if is_html or not isinstance(resp_json, dict):
+                            transfer.status = "Failed"
+                            flash(f"Transfer retry failed: Partner returned non-JSON response ({resp.status_code}).")
+                        else:
+                            returned_device_id = resp_json.get("device_id")
+                            returned_status = resp_json.get("status")
+                            dev_matches = (returned_device_id == device.id or not returned_device_id) if device else True
+                            status_confirmed = (
+                                returned_status in ("success", "received", "ok", "accepted", "queued", "retried_ok")
+                                or (returned_status not in ("error", "failed", "rejected"))
+                                or resp.status_code == 201
+                            )
+                            if dev_matches and status_confirmed:
+                                transfer.status = "Completed"
+                                if device and device.status == "Pending assessment":
+                                    device.transition_to("Processing")
+                                flash("Transfer retry succeeded.")
+                            else:
+                                transfer.status = "Failed"
+                                flash("Transfer retry unconfirmed: missing device confirmation in partner response.")
                     elif resp.status_code == 202:
-                        transfer.status = "Processing"
-                        if device and device.status == "Pending assessment":
-                            device.transition_to("Processing")
-                        flash("Transfer retry accepted by partner.")
+                        if is_json and isinstance(resp_json, dict) and ((device and resp_json.get("device_id") == device.id) or resp_json.get("device_id")):
+                            transfer.status = "Processing"
+                            if device and device.status == "Pending assessment":
+                                device.transition_to("Processing")
+                            flash("Transfer retry accepted by partner.")
+                        else:
+                            transfer.status = "Retryable"
+                            flash("Transfer retry accepted (202) but response was unconfirmed.")
                     elif resp.status_code == 409:
                         transfer.status = "Failed"
                         flash("Partner reported conflict (409) on retry.")
-                    else:
+                    elif resp.status_code in (400, 401, 403, 404, 422):
                         transfer.status = "Failed"
-                        flash(f"Transfer retry failed with status {resp.status_code}.")
+                        err_msg = ""
+                        if is_json and isinstance(resp_json, dict):
+                            err_msg = resp_json.get("message") or resp_json.get("error")
+                        flash(f"Transfer retry rejected with status {resp.status_code}: {err_msg}" if err_msg else f"Transfer retry rejected with status {resp.status_code}.")
+                    else:
+                        transfer.status = "Retryable"
+                        err_msg = ""
+                        if is_json and isinstance(resp_json, dict):
+                            err_msg = resp_json.get("message") or resp_json.get("error")
+                        flash(f"Transfer retry temporary failure ({resp.status_code}): {err_msg}" if err_msg else f"Transfer retry failed with status {resp.status_code}. Marked as Retryable.")
                 except requests.Timeout as e:
                     transfer.http_status = "504 Gateway Timeout"
-                    transfer.response_body = f"Retry network timeout: {str(e)}"
-                    transfer.status = "Failed"
+                    transfer.response_body = f"Retry network timeout: {type(e).__name__}"
+                    transfer.status = "Retryable"
                     transfer.retry_count = (transfer.retry_count or 0) + 1
                     transfer.timestamp = datetime.now(timezone.utc)
-                    flash("Retry failed due to network timeout.")
+                    flash("Retry failed due to network timeout. Marked as Retryable.")
                 except requests.RequestException as e:
                     transfer.http_status = "503 Service Unavailable"
-                    transfer.response_body = f"Retry connection error: {str(e)}"
-                    transfer.status = "Failed"
+                    transfer.response_body = f"Retry connection error: {type(e).__name__}"
+                    transfer.status = "Retryable"
                     transfer.retry_count = (transfer.retry_count or 0) + 1
                     transfer.timestamp = datetime.now(timezone.utc)
-                    flash("Retry failed due to network error.")
+                    flash("Retry failed due to network error. Marked as Retryable.")
         else:
             transfer.status = "Pending"
             transfer.http_status = "Not sent — awaiting dispatch"

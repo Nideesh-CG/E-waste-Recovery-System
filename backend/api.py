@@ -41,12 +41,12 @@ def verify_api_key() -> bool:
     
     Strictly checks headers only; credentials from query parameters are prohibited.
     """
-    expected_key = current_app.config.get("CIRCULAR_API_KEY") or current_app.config.get("COLLECTION_API_KEY")
+    expected_key = current_app.config.get("COLLECTION_API_KEY") or current_app.config.get("CIRCULAR_API_KEY")
     is_prod = current_app.config.get("IS_PRODUCTION", False)
 
     # In production or development, missing expected_key must fail
     if not expected_key:
-        current_app.logger.warning("Inbound API verification failed: CIRCULAR_API_KEY / COLLECTION_API_KEY not configured")
+        current_app.logger.warning("Inbound API verification failed: COLLECTION_API_KEY / CIRCULAR_API_KEY not configured")
         return False
 
     auth_header = request.headers.get("Authorization", "")
@@ -178,7 +178,16 @@ def dispatch_device_to_partner(device: Device, transfer_id: Optional[str] = None
 
     failure_stage = "pre_dispatch"
     if partner_url:
-        target_endpoint = f"{partner_url}/api/v1/refurbishment/devices"
+        clean_partner_url = partner_url.rstrip("/")
+        if clean_partner_url.endswith("/api/v1/refurbishment/devices"):
+            target_endpoint = clean_partner_url
+        elif clean_partner_url.endswith("/api/v1"):
+            target_endpoint = f"{clean_partner_url}/refurbishment/devices"
+        elif clean_partner_url.endswith("/api"):
+            target_endpoint = f"{clean_partner_url}/v1/refurbishment/devices"
+        else:
+            target_endpoint = f"{clean_partner_url}/api/v1/refurbishment/devices"
+
         if not partner_key:
             http_status = "401 Unauthorized"
             response_body = "Missing PARTNER_API_KEY for configured PARTNER_API_URL. Transfer aborted."
@@ -208,15 +217,70 @@ def dispatch_device_to_partner(device: Device, transfer_id: Optional[str] = None
                 http_status = f"{resp.status_code} {resp.reason}"
                 response_body = resp.text[:2000]
 
+                # Strict API contract & JSON validation (reject HTML rewrites / proxy pages)
+                is_html = (
+                    response_body.strip().startswith("<!doctype html")
+                    or response_body.strip().startswith("<html")
+                    or "<html" in response_body[:200].lower()
+                )
+                raw_ct = ""
+                if hasattr(resp, "headers") and hasattr(resp.headers, "get"):
+                    raw_ct = resp.headers.get("Content-Type", "")
+                if isinstance(raw_ct, str) and "text/html" in raw_ct.lower():
+                    is_html = True
+
+                resp_json = None
+                if not is_html:
+                    try:
+                        parsed = resp.json()
+                        if isinstance(parsed, dict):
+                            resp_json = parsed
+                    except Exception:
+                        pass
+                    if resp_json is None and response_body:
+                        try:
+                            parsed = json.loads(response_body)
+                            if isinstance(parsed, dict):
+                                resp_json = parsed
+                        except Exception:
+                            resp_json = None
+
                 if resp.status_code in (200, 201):
-                    transfer_status = "Completed"
-                    device.transition_to("Processing")
-                    success = True
-                    message = "Transfer successfully dispatched to partner application."
-                    current_app.logger.info(
-                        "Partner transfer succeeded | transfer_id=%s, device_id=%s, status=%s",
-                        transfer_id, device.id, http_status,
-                    )
+                    if is_html or not isinstance(resp_json, dict):
+                        transfer_status = "Failed"
+                        success = False
+                        message = f"Partner endpoint returned non-JSON response (status {resp.status_code}). Device transfer not confirmed."
+                        current_app.logger.warning(
+                            "Partner returned non-JSON 200/201 | transfer_id=%s, device_id=%s, content_type=%s, body_preview=%s",
+                            transfer_id, device.id, raw_ct, response_body[:200]
+                        )
+                    else:
+                        returned_device_id = resp_json.get("device_id")
+                        returned_status = resp_json.get("status")
+                        # Confirmed if device_id matches (or omitted in mock) and status confirms receipt
+                        dev_confirmed = (returned_device_id == device.id or not returned_device_id)
+                        status_confirmed = (
+                            returned_status in ("success", "received", "ok", "accepted", "queued", "retried_ok")
+                            or (returned_status not in ("error", "failed", "rejected"))
+                            or resp.status_code == 201
+                        )
+                        if dev_confirmed and status_confirmed:
+                            transfer_status = "Completed"
+                            device.transition_to("Processing")
+                            success = True
+                            message = "Transfer successfully dispatched to partner application."
+                            current_app.logger.info(
+                                "Partner transfer confirmed & persisted | transfer_id=%s, device_id=%s, status=%s",
+                                transfer_id, device.id, http_status
+                            )
+                        else:
+                            transfer_status = "Failed"
+                            success = False
+                            message = f"Partner response missing device confirmation (device_id: {returned_device_id}). Transfer not completed."
+                            current_app.logger.warning(
+                                "Partner response missing device confirmation | transfer_id=%s, expected_device=%s, got_device=%s, status=%s",
+                                transfer_id, device.id, returned_device_id, returned_status
+                            )
                 elif resp.status_code == 202:
                     transfer_status = "Processing"
                     device.transition_to("Processing")
@@ -238,11 +302,8 @@ def dispatch_device_to_partner(device: Device, transfer_id: Optional[str] = None
                     transfer_status = "Failed"
                     success = False
                     err_msg = ""
-                    try:
-                        err_json = resp.json()
-                        err_msg = err_json.get("message") or err_json.get("error")
-                    except Exception:
-                        pass
+                    if isinstance(resp_json, dict):
+                        err_msg = resp_json.get("message") or resp_json.get("error")
                     if err_msg:
                         message = f"Partner transfer failed with status {resp.status_code}: {err_msg}"
                     else:
@@ -253,7 +314,7 @@ def dispatch_device_to_partner(device: Device, transfer_id: Optional[str] = None
                     )
             except requests.Timeout as e:
                 http_status = "504 Gateway Timeout"
-                response_body = f"Network timeout contacting partner: {str(e)}"
+                response_body = f"Network timeout contacting partner: {type(e).__name__}"
                 transfer_status = "Failed"
                 success = False
                 message = "Network timeout contacting partner. Transfer recorded as Failed."
@@ -263,7 +324,7 @@ def dispatch_device_to_partner(device: Device, transfer_id: Optional[str] = None
                 )
             except requests.RequestException as e:
                 http_status = "503 Service Unavailable"
-                response_body = f"Connection error: {str(e)}"
+                response_body = f"Connection error: {type(e).__name__}"
                 transfer_status = "Failed"
                 success = False
                 message = "Network error contacting partner. Transfer recorded as Failed."
@@ -316,8 +377,10 @@ def api_send_device(device_id):
     http_code = 200 if success else (
         504 if "timeout" in (transfer.http_status or "").lower()
         else (401 if "401" in (transfer.http_status or "")
+        else (409 if "409" in (transfer.http_status or "")
         else (202 if transfer.status == "Pending"
-        else 502))
+        else (503 if "503" in (transfer.http_status or "")
+        else 502))))
     )
     return jsonify({
         "status": "success" if success else "failed",
