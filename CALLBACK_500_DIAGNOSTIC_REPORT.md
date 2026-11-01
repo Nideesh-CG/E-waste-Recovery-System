@@ -7,7 +7,9 @@
 **Deployment Platform:** Vercel (Fluid Compute Serverless)  
 **Database:** Shared Supabase PostgreSQL (Schema: `collection`)  
 **Target Production Endpoint:** `POST /api/v1/assessment-results`  
-**Target Production Device:** `EW-2026-D86F5C8F` (`HP Omen Hyper X`)  
+**Target Production Devices:** 
+1. `EW-2026-D86F5C8F` (`HP Omen Hyper X`)
+2. `EW-2026-B834E735` (`Lenovo ThinkPad T14`)  
 **Date:** November 1, 2026  
 **Status:** **RESOLVED, FULLY INSTRUMENTED & VERIFIED**
 
@@ -15,9 +17,15 @@
 
 ## 1. Executive Summary
 
-When the Partner Refurbishment Application evaluated incoming devices (e.g. `HP Omen Hyper X`, `EW-2026-D86F5C8F`) and dispatched the assessment results back to the Collection Application via `POST /api/v1/assessment-results`, every callback returned `HTTP 500 Internal Server Error`. Meanwhile, the incoming forward transfer (`Collection -> Partner`) operated normally and returned `HTTP 201 Created`.
+When the Partner Refurbishment Application evaluated incoming devices (e.g. `HP Omen Hyper X` `EW-2026-D86F5C8F` and `Lenovo ThinkPad T14` `EW-2026-B834E735`) and dispatched the assessment results back to the Collection Application via `POST /api/v1/assessment-results`, the callback returned `HTTP 500 Internal Server Error`. Consequently, the devices in the Collection dashboard remained stuck in `Processing` status. Meanwhile, the incoming forward transfer (`Collection -> Partner`) operated normally and returned `HTTP 201 Created`.
 
-A thorough trace of every operation from request reception, header inspection, payload validation, device lookup, record creation, through database commit identified the exact exceptions and structural vulnerabilities. Comprehensive structured server-side logging across all 8 stages, defensive numeric coercion, database schema widening, and transactional fallbacks were implemented and verified.
+A thorough trace of every operation from request reception, header inspection, payload validation, device lookup, record creation, through database commit identified the exact exceptions and structural vulnerabilities:
+1. Missing `COLLECTION_API_KEY` attribute on `Config` class causing environment key lookups to fail.
+2. PostgreSQL `DatatypeMismatch` when binding `Float` parameters to legacy `INTEGER` columns in `collection.assessment_results`.
+3. Unique constraint violations on `Transfer.idempotency_key` upon retried callbacks.
+4. Rigid validation failing on missing optional fields or nested payload dictionaries (`data["assessment"]`).
+
+Comprehensive structured server-side logging across all 8 stages, defensive numeric coercion, database schema widening, safe optional field defaults, and multi-tier transactional fallbacks (including raw SQL upserts) were implemented and verified across 99 automated tests.
 
 ---
 
@@ -145,19 +153,29 @@ Verified via automated test suite in [`backend/tests/test_failing_device_callbac
   - Estimated Refurbished Value: `₹14,000`
   - Environmental Benefit: `4.3 kg CO2 avoided`
   - Recommendation: `PARTS RECOVERY`
+* **Target Device 2:** `Lenovo ThinkPad T14` (`EW-2026-B834E735`)
+  - Repairability: `62.5/100`
+  - Circular Score: `68.0/100`
+  - Repair Cost: `₹4,500`
+  - Component Recovery Value: `₹8,200`
+  - Environmental Benefit: `5.2 kg CO2 avoided`
+  - Recommendation: `PARTS RECOVERY`
 * **Test Results:**
   ```text
-  backend/tests/test_failing_device_callback.py ..... [100%]
-  ============================== 5 passed in 3.04s ==============================
+  backend/tests/test_failing_device_callback.py ........ [100%]
+  ============================== 8 passed in 3.32s ==============================
   ```
   * `test_hp_omen_callback_with_float_scores_and_parts_recovery`: PASSED (HTTP 200, state transitions to `"Parts recovery"`, score persisted as `59.5`).
   * `test_hp_omen_callback_with_admin_api_key`: PASSED (Authenticated via `Bearer <ADMIN_API_KEY>`).
   * `test_unauthorized_callback_rejected`: PASSED (Missing/invalid keys return HTTP 401).
   * `test_hp_omen_callback_with_formatted_strings`: PASSED (Formatted strings `₹6,600`, `59.5/100`, `4.3 kg` parsed without error).
   * `test_assessment_persists_and_reflects_in_reports_and_metrics`: PASSED (Verified real metrics increment `parts_recovery` count, add ₹9,700 recovery value, and generate technical PDF report).
+  * `test_ew_2026_b834e735_callback_delivery_with_collection_api_key`: PASSED (Device transitions out of `Processing` to `Parts recovery`, scores persisted).
+  * `test_ew_2026_b834e735_missing_optional_fields_and_nested_payload`: PASSED (Safe defaults for optional fields, nested payload parsed).
+  * `test_ew_2026_b834e735_duplicate_idempotent_retry`: PASSED (Duplicate requests return 200 OK without creating duplicate records).
 
 ### 2. Full Test Suite Execution:
-* **Collection Application Tests:** **96 passed in 44.52s** (`pytest backend/tests`).
+* **Collection Application Tests:** **99 passed in 43.43s** (`pytest backend/tests`).
 * **Partner Application Tests:** **98 passed in 8.99s** (`pytest backend/tests`).
 * **Bidirectional End-to-End Tests:** **9 passed in 6.00s** (`test_end_to_end_integration.py`).
 * **Linear Migration Chain:** **Verified active head `b7a8c9d0e1f2`** (`verify_migrations.py`).

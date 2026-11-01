@@ -255,3 +255,189 @@ def test_assessment_persists_and_reflects_in_reports_and_metrics(client, app):
         pdf_bytes = generate_assessment_pdf(dev.to_dict(), asmt.to_dict())
         assert len(pdf_bytes) > 500
         assert pdf_bytes.startswith(b"%PDF")
+
+
+def test_ew_2026_b834e735_callback_delivery_with_collection_api_key(client, app):
+    """Target verification test for reported device EW-2026-B834E735 stuck in Processing."""
+    b834_id = "EW-2026-B834E735"
+    with app.app_context():
+        dev = Device.query.filter_by(id=b834_id).first()
+        if not dev:
+            dev = Device(
+                id=b834_id,
+                name="Lenovo ThinkPad T14",
+                type="Laptop",
+                brand="Lenovo",
+                model="ThinkPad T14 Gen 2",
+                status="Processing",
+                condition="Used",
+                year="2021",
+                weight="1.5",
+                damage="Motherboard issue, good battery and screen",
+                power="Powers on",
+                screen="Flawless",
+                battery="Good",
+            )
+            db.session.add(dev)
+        else:
+            dev.status = "Processing"
+        db.session.commit()
+
+    payload = {
+        "device_id": b834_id,
+        "transfer_id": "TRF-OUT-B834E735",
+        "assessment_id": "ASM-B834E735",
+        "idempotency_key": "ASM-B834E735",
+        "repairability_score": 62.5,
+        "circular_recovery_score": 68.0,
+        "technical_condition_score": 65.0,
+        "age_score": 70.0,
+        "confidence_level": "High",
+        "repair_cost": 4500.0,
+        "estimated_repair_cost": 4500.0,
+        "component_value": 8200.0,
+        "component_recovery_value": 8200.0,
+        "estimated_refurbished_value": 16000.0,
+        "recommendation": "PARTS RECOVERY",
+        "recommended_action": "PARTS RECOVERY",
+        "co2_avoided_kg": 5.2,
+        "environmental_benefit": 5.2,
+        "notes": "Cost-effective parts harvesting recommended for display and RAM modules.",
+        "assessed_at": "2026-11-01T15:30:00Z"
+    }
+
+    # Authenticate via COLLECTION_API_KEY
+    headers = {
+        "X-API-Key": "test-circular-api-key-2026",
+        "Authorization": "Bearer test-circular-api-key-2026",
+        "Idempotency-Key": "ASM-B834E735",
+        "Content-Type": "application/json",
+    }
+
+    resp = client.post("/api/v1/assessment-results", headers=headers, json=payload)
+    assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.data.decode()}"
+    data = resp.get_json()
+    assert data["success"] is True
+    assert data["status"] == "success"
+    assert data["device_id"] == b834_id
+    assert data["new_device_status"] == "Parts recovery"
+    assert data["assessment"]["repairability_score"] == 62.5
+    assert data["assessment"]["circular_recovery_score"] == 68.0
+
+    with app.app_context():
+        # Verify device is no longer in Processing
+        updated_dev = Device.query.filter_by(id=b834_id).first()
+        assert updated_dev is not None
+        assert updated_dev.status == "Parts recovery"
+        assert updated_dev.status != "Processing"
+
+        # Verify assessment record
+        asmt = AssessmentResult.query.filter_by(device_id=b834_id).first()
+        assert asmt is not None
+        assert asmt.repairability_score == 62.5
+        assert asmt.recommendation == "PARTS_RECOVERY"
+
+
+def test_ew_2026_b834e735_missing_optional_fields_and_nested_payload(client, app):
+    """Test safe handling when optional fields are omitted or payload is nested under 'assessment'."""
+    nested_id = "EW-2026-B834E735"
+    with app.app_context():
+        dev = Device.query.filter_by(id=nested_id).first()
+        if not dev:
+            dev = Device(
+                id=nested_id,
+                name="Lenovo ThinkPad T14",
+                type="Laptop",
+                brand="Lenovo",
+                model="ThinkPad T14",
+                status="Processing",
+                condition="Used",
+                year="2021",
+                weight="1.5",
+            )
+            db.session.add(dev)
+        else:
+            dev.status = "Processing"
+        db.session.commit()
+
+    # Payload with nested assessment dict and missing optional financial/environmental fields
+    nested_payload = {
+        "device_id": nested_id,
+        "assessment_id": "ASM-NESTED-B834",
+        "assessment": {
+            "repairability_score": 75.0,
+            "circular_recovery_score": 80.0,
+            "recommendation": "REFURBISH",
+            "notes": "Good condition unit suitable for refurbishment.",
+        }
+    }
+    headers = {
+        "X-API-Key": "test-circular-api-key-2026",
+        "Content-Type": "application/json",
+    }
+
+    resp = client.post("/api/v1/assessment-results", headers=headers, json=nested_payload)
+    assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.data.decode()}"
+    data = resp.get_json()
+    assert data["success"] is True
+    assert data["new_device_status"] == "Refurbishment"
+    assert data["assessment"]["repair_cost"] == 0.0  # safely defaulted
+    assert data["assessment"]["component_value"] == 0.0  # safely defaulted
+    assert data["assessment"]["co2_avoided_kg"] == 0.0  # safely defaulted
+
+
+def test_ew_2026_b834e735_duplicate_idempotent_retry(client, app):
+    """Test that partner retrying the assessment delivers idempotent 200 OK without duplicating records."""
+    retry_id = "EW-2026-B834E735"
+    with app.app_context():
+        dev = Device.query.filter_by(id=retry_id).first()
+        if not dev:
+            dev = Device(
+                id=retry_id,
+                name="Lenovo ThinkPad T14",
+                type="Laptop",
+                brand="Lenovo",
+                model="ThinkPad T14",
+                status="Processing",
+                condition="Used",
+                year="2021",
+                weight="1.5",
+            )
+            db.session.add(dev)
+        else:
+            dev.status = "Processing"
+        db.session.commit()
+
+    payload = {
+        "device_id": retry_id,
+        "assessment_id": "ASM-RETRY-TEST",
+        "idempotency_key": "ASM-RETRY-TEST",
+        "repairability_score": 55.0,
+        "circular_recovery_score": 60.0,
+        "recommendation": "PARTS RECOVERY",
+        "repair_cost": 5000.0,
+        "component_value": 7500.0,
+        "co2_avoided_kg": 3.8,
+    }
+    headers = {
+        "X-API-Key": "test-circular-api-key-2026",
+        "Idempotency-Key": "ASM-RETRY-TEST",
+        "Content-Type": "application/json",
+    }
+
+    # First attempt
+    resp1 = client.post("/api/v1/assessment-results", headers=headers, json=payload)
+    assert resp1.status_code == 200
+
+    # Second attempt (retry)
+    resp2 = client.post("/api/v1/assessment-results", headers=headers, json=payload)
+    assert resp2.status_code == 200
+    data2 = resp2.get_json()
+    assert data2["success"] is True
+    assert data2.get("idempotent") is True or data2.get("status") == "success"
+
+    with app.app_context():
+        # Ensure only 1 AssessmentResult exists for this device
+        asmts = AssessmentResult.query.filter_by(device_id=retry_id).all()
+        assert len(asmts) == 1
+
