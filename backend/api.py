@@ -26,14 +26,22 @@ CANONICAL_RECOMMENDATIONS = {
 
 RECOMMENDATION_ALIASES = {
     "REFURBISH": "REFURBISH",
+    "REFURBISHMENT": "REFURBISH",
     "PARTS_RECOVERY": "PARTS_RECOVERY",
     "PARTS RECOVERY": "PARTS_RECOVERY",
     "PARTS": "PARTS_RECOVERY",
+    "HARVEST_COMPONENTS": "PARTS_RECOVERY",
+    "HARVEST COMPONENTS": "PARTS_RECOVERY",
+    "HARVEST": "PARTS_RECOVERY",
+    "COMPONENT_RECOVERY": "PARTS_RECOVERY",
+    "COMPONENT RECOVERY": "PARTS_RECOVERY",
     "RECYCLE": "RECYCLE",
+    "RECYCLING": "RECYCLE",
     "SAFE_DISPOSAL": "SAFE_DISPOSAL",
     "SAFE DISPOSAL": "SAFE_DISPOSAL",
     "DISPOSAL": "SAFE_DISPOSAL",
     "REJECT": "REJECT",
+    "REJECTED": "REJECT",
 }
 
 
@@ -43,12 +51,17 @@ def verify_api_key() -> bool:
     Strictly checks headers only; credentials from query parameters are prohibited.
     Accepts valid inbound partner keys (COLLECTION_API_KEY, CIRCULAR_API_KEY) and ADMIN_API_KEY.
     """
+    import os
     key_sources = [
-        ("COLLECTION_API_KEY", current_app.config.get("COLLECTION_API_KEY")),
-        ("CIRCULAR_API_KEY", current_app.config.get("CIRCULAR_API_KEY")),
-        ("ADMIN_API_KEY", current_app.config.get("ADMIN_API_KEY")),
+        ("COLLECTION_API_KEY", current_app.config.get("COLLECTION_API_KEY") or os.environ.get("COLLECTION_API_KEY")),
+        ("CIRCULAR_API_KEY", current_app.config.get("CIRCULAR_API_KEY") or os.environ.get("CIRCULAR_API_KEY")),
+        ("ADMIN_API_KEY", current_app.config.get("ADMIN_API_KEY") or os.environ.get("ADMIN_API_KEY")),
     ]
-    valid_expected_keys = [(name, str(k).strip()) for name, k in key_sources if k and str(k).strip()]
+    valid_expected_keys = [
+        (name, str(k).strip().strip("\"'"))
+        for name, k in key_sources
+        if k and str(k).strip().strip("\"'")
+    ]
 
     # In production or development, missing expected keys must fail
     if not valid_expected_keys:
@@ -60,34 +73,38 @@ def verify_api_key() -> bool:
     auth_header = request.headers.get("Authorization", "")
     api_key_header = request.headers.get("X-API-Key", "")
 
-    provided_key = None
-    auth_scheme = None
+    provided_keys = []
     if api_key_header:
-        provided_key = api_key_header.strip()
-        auth_scheme = "X-API-Key"
-    elif auth_header.startswith("Bearer "):
-        provided_key = auth_header.split("Bearer ", 1)[1].strip()
-        auth_scheme = "Bearer"
+        provided_keys.append(("X-API-Key", api_key_header.strip().strip("\"'")))
+    if auth_header:
+        parts = auth_header.strip().split(None, 1)
+        if len(parts) == 2 and parts[0].lower() in ("bearer", "token", "apikey"):
+            provided_keys.append((parts[0].capitalize(), parts[1].strip().strip("\"'")))
+        else:
+            provided_keys.append(("Authorization", auth_header.strip().strip("\"'")))
 
     # Reject query parameter credentials and empty keys
-    if not provided_key:
+    if not provided_keys:
         current_app.logger.warning(
             "[ASSESSMENT_CALLBACK_STAGE_2] Authentication failed: No key header provided | path=%s",
             request.path
         )
         return False
 
-    for key_name, exp_key in valid_expected_keys:
-        if secrets.compare_digest(provided_key, exp_key):
-            current_app.logger.info(
-                "[ASSESSMENT_CALLBACK_STAGE_2] Authentication succeeded | path=%s, scheme=%s, matched_source=%s",
-                request.path, auth_scheme, key_name
-            )
-            return True
+    for auth_scheme, provided_key in provided_keys:
+        if not provided_key:
+            continue
+        for key_name, exp_key in valid_expected_keys:
+            if secrets.compare_digest(provided_key, exp_key):
+                current_app.logger.info(
+                    "[ASSESSMENT_CALLBACK_STAGE_2] Authentication succeeded | path=%s, scheme=%s, matched_source=%s",
+                    request.path, auth_scheme, key_name
+                )
+                return True
 
     current_app.logger.warning(
-        "[ASSESSMENT_CALLBACK_STAGE_2] Authentication failed: Provided key did not match any authorized key | path=%s, scheme=%s",
-        request.path, auth_scheme
+        "[ASSESSMENT_CALLBACK_STAGE_2] Authentication failed: Provided key did not match any authorized key | path=%s",
+        request.path
     )
     return False
 
@@ -541,19 +558,26 @@ def receive_assessment():
         current_app.logger.warning("[ASSESSMENT_CALLBACK_STAGE_1] Empty or non-dict JSON body")
         return jsonify({"error": "Bad Request", "message": "Empty or malformed JSON payload"}), 400
 
+    asmt_sub = data.get("assessment") if isinstance(data.get("assessment"), dict) else {}
+
+    def get_field(*keys):
+        """Helper to extract field from top-level payload or nested assessment dict."""
+        for k in keys:
+            if k in data and data[k] is not None:
+                return data[k]
+            if k in asmt_sub and asmt_sub[k] is not None:
+                return asmt_sub[k]
+        return None
+
     # 1. Check idempotency key (header or payload)
     idempotency_key = (
         request.headers.get("Idempotency-Key") or
         request.headers.get("X-Idempotency-Key") or
-        data.get("idempotency_key") or
-        data.get("assessment_id") or
-        data.get("event_id")
+        get_field("idempotency_key", "assessment_id", "event_id")
     )
     is_force = bool(
         request.headers.get("X-Force-Update")
-        or data.get("force_resend")
-        or data.get("force")
-        or data.get("retry")
+        or get_field("force_resend", "force", "retry")
     )
     if idempotency_key and not is_force:
         try:
@@ -573,7 +597,7 @@ def receive_assessment():
                         "message": "Assessment received successfully",
                         "transfer_id": existing_transfer.id,
                         "device_id": existing_transfer.device_id,
-                        "assessment_id": data.get("assessment_id") or str(idempotency_key),
+                        "assessment_id": get_field("assessment_id") or str(idempotency_key),
                         "new_device_status": existing_dev.status if existing_dev else "Completed",
                         "assessment": existing_asmt.to_dict()
                     }), 200
@@ -583,8 +607,10 @@ def receive_assessment():
                 idemp_err, exc_info=True
             )
 
-    # 2. Check device existence first
-    device_id = data.get("device_id")
+    # 2. Check device existence (top-level, nested assessment, or nested device dict)
+    device_id = get_field("device_id", "id")
+    if not device_id and isinstance(data.get("device"), dict):
+        device_id = data["device"].get("id") or data["device"].get("device_id")
     if not device_id:
         current_app.logger.warning("[ASSESSMENT_CALLBACK_STAGE_3] Validation failure: device_id is missing")
         return jsonify({"error": "Validation Error", "message": "device_id is required"}), 400
@@ -593,6 +619,11 @@ def receive_assessment():
     failure_stage = "device_lookup"
     try:
         device = Device.query.filter_by(id=clean_device_id).first()
+        if not device:
+            # Case-insensitive lookup fallback
+            device = Device.query.filter(db.func.lower(Device.id) == clean_device_id.lower()).first()
+            if device:
+                clean_device_id = device.id
     except Exception as db_err:
         current_app.logger.error(
             "[ASSESSMENT_CALLBACK_ERROR] Database query failure during device lookup | device_id=%s, error=%s",
@@ -614,24 +645,30 @@ def receive_assessment():
     # 3. Numeric range and format validation with extract_numeric()
     failure_stage = "payload_validation"
     try:
-        r_raw = data.get("repairability_score") if "repairability_score" in data else data.get("repairability")
+        r_raw = get_field("repairability_score", "repairability", "score")
         repairability = extract_numeric(r_raw, "repairability_score", min_val=0.0, max_val=100.0)
 
-        c_raw = data.get("circular_recovery_score") if "circular_recovery_score" in data else data.get("circular_score")
+        c_raw = get_field("circular_recovery_score", "circular_score", "recovery_score")
         recovery_score = extract_numeric(c_raw, "circular_recovery_score", min_val=0.0, max_val=100.0)
         if recovery_score is None and repairability is not None:
-            recovery_score = repairability  # Default fallback if partner payload does not supply separate recovery score
+            recovery_score = repairability  # Default fallback if partner payload supplies repairability only
         if repairability is None and recovery_score is not None:
             repairability = recovery_score
 
-        rc_raw = data.get("repair_cost") if "repair_cost" in data else data.get("estimated_repair_cost")
-        repair_cost = extract_numeric(rc_raw, "repair_cost", min_val=0.0)
+        rc_raw = get_field("repair_cost", "estimated_repair_cost", "cost")
+        repair_cost = extract_numeric(rc_raw, "repair_cost", min_val=0.0, default=0.0)
+        if repair_cost is None:
+            repair_cost = 0.0
 
-        comp_val_raw = data.get("component_value") if "component_value" in data else data.get("component_recovery_value")
-        component_val = extract_numeric(comp_val_raw, "component_value", min_val=0.0)
+        comp_val_raw = get_field("component_value", "component_recovery_value", "parts_value")
+        component_val = extract_numeric(comp_val_raw, "component_value", min_val=0.0, default=0.0)
+        if component_val is None:
+            component_val = 0.0
 
-        co2_raw = data.get("co2_avoided_kg") if "co2_avoided_kg" in data else data.get("environmental_benefit")
-        co2_avoided = extract_numeric(co2_raw, "co2_avoided_kg", min_val=0.0)
+        co2_raw = get_field("co2_avoided_kg", "environmental_benefit", "co2_avoided", "co2_saved")
+        co2_avoided = extract_numeric(co2_raw, "co2_avoided_kg", min_val=0.0, default=0.0)
+        if co2_avoided is None:
+            co2_avoided = 0.0
 
     except ValueError as val_err:
         current_app.logger.warning(
@@ -640,23 +677,20 @@ def receive_assessment():
         )
         return jsonify({"error": "Validation Error", "message": str(val_err)}), 400
 
-    # 4. Required field presence validation - NO fabricated defaults
-    rec_val = data.get("recommendation") or data.get("recommended_action")
+    # 4. Required field presence validation
+    rec_val = get_field("recommendation", "recommended_action", "action", "outcome")
     if (
         repairability is None
         or recovery_score is None
-        or repair_cost is None
-        or component_val is None
-        or co2_avoided is None
         or not rec_val
     ):
         current_app.logger.warning(
-            "[ASSESSMENT_CALLBACK_STAGE_3] Missing required fields | device_id=%s, repairability=%s, recovery_score=%s, repair_cost=%s, component_val=%s, co2=%s, rec_val=%s",
-            clean_device_id, repairability, recovery_score, repair_cost, component_val, co2_avoided, bool(rec_val)
+            "[ASSESSMENT_CALLBACK_STAGE_3] Missing required fields | device_id=%s, repairability=%s, recovery_score=%s, rec_val=%s",
+            clean_device_id, repairability, recovery_score, bool(rec_val)
         )
         return jsonify({
             "error": "Validation Error",
-            "message": "Missing required assessment fields: repairability_score, circular_recovery_score, repair_cost, component_value, recommendation, co2_avoided_kg"
+            "message": "Missing required assessment fields: repairability_score, circular_recovery_score, recommendation"
         }), 400
 
     # 5. Recommendation validation & canonical mapping
@@ -679,10 +713,10 @@ def receive_assessment():
         }), 400
 
     # 6. String length limits and metadata fields
-    assessed_by = str(data.get("assessed_by", "GreenTech Refurbishment Partner")).strip()[:128]
-    notes = str(data.get("notes") or data.get("technical_summary") or "").strip()[:2000]
+    assessed_by = str(get_field("assessed_by", "partner", "assessor") or "GreenTech Refurbishment Partner").strip()[:128]
+    notes = str(get_field("notes", "technical_summary", "summary") or "").strip()[:2000]
 
-    factors_raw = data.get("factors") or data.get("reasons") or data.get("component_breakdown")
+    factors_raw = get_field("factors", "reasons", "component_breakdown", "breakdown")
     if isinstance(factors_raw, (list, dict)):
         factors_str = json.dumps(factors_raw)
     elif isinstance(factors_raw, str):
@@ -690,7 +724,7 @@ def receive_assessment():
     else:
         factors_str = None
 
-    assessed_at_raw = data.get("assessment_date") or data.get("assessed_at")
+    assessed_at_raw = get_field("assessment_date", "assessed_at", "date", "timestamp")
     assessed_at_val = None
     if assessed_at_raw:
         try:
@@ -715,8 +749,9 @@ def receive_assessment():
         clean_device_id, repairability, recovery_score, repair_cost, component_val, co2_avoided, canonical_rec, new_status
     )
 
-    # Verify lifecycle prerequisites: device MUST be in 'Processing' or already in target new_status (for idempotent retries/resends)
-    if device.status != "Processing" and device.status != new_status:
+    # Verify lifecycle prerequisites:
+    # A device in 'Pending assessment' has not undergone the intake workflow
+    if device.status == "Pending assessment":
         current_app.logger.warning(
             "[ASSESSMENT_CALLBACK_STAGE_4] State conflict | device_id=%s, current_status=%s, target_status=%s",
             clean_device_id, device.status, new_status
@@ -726,12 +761,23 @@ def receive_assessment():
             "message": f"Device {clean_device_id} is in status '{device.status}' and cannot transition to '{new_status}'. Device must be in 'Processing' before assessment can be applied."
         }), 409
 
+    # A device in 'Completed' without explicit force/idempotency is final
+    if device.status == "Completed" and not is_force and not idempotency_key:
+        current_app.logger.warning(
+            "[ASSESSMENT_CALLBACK_STAGE_4] State conflict on completed device | device_id=%s, current_status=%s",
+            clean_device_id, device.status
+        )
+        return jsonify({
+            "error": "Conflict",
+            "message": f"Device {clean_device_id} is in status '{device.status}' and cannot transition to '{new_status}'."
+        }), 409
+
     current_app.logger.info(
         "[ASSESSMENT_CALLBACK_STAGE_4] Device lookup result | device_id=%s, found=True, current_status=%s, target_status=%s",
         clean_device_id, device.status, new_status
     )
 
-    assessment_id_val = str(data.get("assessment_id") or f"ASM-{clean_device_id}")
+    assessment_id_val = str(get_field("assessment_id") or f"ASM-{clean_device_id}")
 
     # Transactional execution
     failure_stage = "assessment_persistence"
@@ -743,12 +789,12 @@ def receive_assessment():
             assessment = AssessmentResult(device_id=clean_device_id)
             db.session.add(assessment)
 
-        assessment.repairability_score = repairability
-        assessment.circular_recovery_score = recovery_score
-        assessment.repair_cost = repair_cost
-        assessment.component_value = component_val
+        assessment.repairability_score = float(repairability)
+        assessment.circular_recovery_score = float(recovery_score)
+        assessment.repair_cost = float(repair_cost)
+        assessment.component_value = float(component_val)
         assessment.recommendation = canonical_rec
-        assessment.co2_avoided_kg = co2_avoided
+        assessment.co2_avoided_kg = float(co2_avoided)
         assessment.assessed_by = assessed_by
         assessment.notes = notes
         assessment.factors = factors_str
@@ -772,7 +818,15 @@ def receive_assessment():
 
         inbound_transfer = None
         if idempotency_key:
-            inbound_transfer = Transfer.query.filter_by(idempotency_key=str(idempotency_key)).first()
+            inbound_transfer = Transfer.query.filter(
+                (Transfer.idempotency_key == str(idempotency_key)) |
+                (Transfer.id == str(idempotency_key))
+            ).first()
+        if not inbound_transfer:
+            inbound_transfer = Transfer.query.filter(
+                Transfer.device_id == clean_device_id,
+                Transfer.sender == "Refurbishment"
+            ).first()
 
         if not inbound_transfer:
             transfer_id = f"TRF-{secrets.token_hex(4).upper()}"
@@ -794,12 +848,15 @@ def receive_assessment():
             db.session.add(inbound_transfer)
         else:
             transfer_id = inbound_transfer.id
+            inbound_transfer.device_id = device.id
             inbound_transfer.status = "Completed"
             inbound_transfer.http_status = "200 OK"
             inbound_transfer.response_body = "Assessment intelligence received and processed successfully."
             inbound_transfer.payload = json.dumps(data)
             inbound_transfer.timestamp = now
             inbound_transfer.time = f"Today, {now.strftime('%I:%M %p')}"
+            if idempotency_key and not inbound_transfer.idempotency_key:
+                inbound_transfer.idempotency_key = str(idempotency_key)
 
         current_app.logger.info(
             "[ASSESSMENT_CALLBACK_STAGE_7] Transfer audit prepared | transfer_id=%s, device_id=%s, status=%s",
@@ -821,18 +878,43 @@ def receive_assessment():
         except Exception as commit_err:
             db.session.rollback()
             current_app.logger.warning(
-                "[ASSESSMENT_CALLBACK_STAGE_6] Primary commit failed (%s: %s). Activating integer score coercion fallback for schema compatibility.",
+                "[ASSESSMENT_CALLBACK_STAGE_6] Primary commit failed (%s: %s). Activating schema reconciliation and fallback persistence.",
                 type(commit_err).__name__, commit_err, exc_info=True
             )
+            is_pg = "postgresql" in str(db.engine.url)
+            if is_pg:
+                try:
+                    db.session.execute(text(
+                        "DO $$ BEGIN "
+                        "IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'collection' AND table_name = 'assessment_results') THEN "
+                        "  BEGIN ALTER TABLE collection.assessment_results ALTER COLUMN repairability_score TYPE DOUBLE PRECISION USING repairability_score::double precision; EXCEPTION WHEN OTHERS THEN NULL; END; "
+                        "  BEGIN ALTER TABLE collection.assessment_results ALTER COLUMN circular_recovery_score TYPE DOUBLE PRECISION USING circular_recovery_score::double precision; EXCEPTION WHEN OTHERS THEN NULL; END; "
+                        "END IF; "
+                        "IF EXISTS (SELECT 1 FROM information_schema.sequences WHERE sequence_schema = 'collection' AND sequence_name = 'assessment_results_id_seq') THEN "
+                        "  BEGIN PERFORM setval('collection.assessment_results_id_seq', COALESCE((SELECT MAX(id) FROM collection.assessment_results), 1)); EXCEPTION WHEN OTHERS THEN NULL; END; "
+                        "END IF; "
+                        "END $$;"
+                    ))
+                    db.session.commit()
+                except Exception as ddl_err:
+                    db.session.rollback()
+                    current_app.logger.warning("[ASSESSMENT_CALLBACK_STAGE_6] Dynamic DDL reconciliation failed: %s", ddl_err)
+
             # Re-fetch records after rollback
             device = Device.query.filter_by(id=clean_device_id).first()
+            if device:
+                if device.status == "Processing" or device.can_transition_to(new_status):
+                    device.transition_to(new_status)
+                else:
+                    device.status = new_status
+
             assessment = AssessmentResult.query.filter_by(device_id=clean_device_id).first()
             if not assessment:
                 assessment = AssessmentResult(device_id=clean_device_id)
                 db.session.add(assessment)
 
-            assessment.repairability_score = int(round(repairability))
-            assessment.circular_recovery_score = int(round(recovery_score))
+            assessment.repairability_score = float(repairability)
+            assessment.circular_recovery_score = float(recovery_score)
             assessment.repair_cost = float(repair_cost)
             assessment.component_value = float(component_val)
             assessment.recommendation = canonical_rec
@@ -842,15 +924,18 @@ def receive_assessment():
             assessment.factors = factors_str
             assessment.assessed_at = assessed_at_val
 
-            if device:
-                if device.status == "Processing" or device.can_transition_to(new_status):
-                    device.transition_to(new_status)
-                else:
-                    device.status = new_status
-
             inbound_transfer = None
             if idempotency_key:
-                inbound_transfer = Transfer.query.filter_by(idempotency_key=str(idempotency_key)).first()
+                inbound_transfer = Transfer.query.filter(
+                    (Transfer.idempotency_key == str(idempotency_key)) |
+                    (Transfer.id == str(idempotency_key))
+                ).first()
+            if not inbound_transfer:
+                inbound_transfer = Transfer.query.filter(
+                    Transfer.device_id == clean_device_id,
+                    Transfer.sender == "Refurbishment"
+                ).first()
+
             if not inbound_transfer:
                 transfer_id = f"TRF-{secrets.token_hex(4).upper()}"
                 inbound_transfer = Transfer(
@@ -871,6 +956,7 @@ def receive_assessment():
                 db.session.add(inbound_transfer)
             else:
                 transfer_id = inbound_transfer.id
+                inbound_transfer.device_id = clean_device_id
                 inbound_transfer.status = "Completed"
                 inbound_transfer.http_status = "200 OK"
                 inbound_transfer.response_body = "Assessment intelligence received and processed successfully."
@@ -878,11 +964,106 @@ def receive_assessment():
                 inbound_transfer.timestamp = now
                 inbound_transfer.time = f"Today, {now.strftime('%I:%M %p')}"
 
-            db.session.commit()
-            current_app.logger.info(
-                "[ASSESSMENT_CALLBACK_STAGE_6] Fallback database commit succeeded | device_id=%s, transfer_id=%s, device_status=%s",
-                clean_device_id, transfer_id, device.status
-            )
+            try:
+                db.session.commit()
+                current_app.logger.info(
+                    "[ASSESSMENT_CALLBACK_STAGE_6] Fallback ORM database commit succeeded | device_id=%s, transfer_id=%s, device_status=%s",
+                    clean_device_id, transfer_id, device.status
+                )
+            except Exception as second_commit_err:
+                db.session.rollback()
+                current_app.logger.warning(
+                    "[ASSESSMENT_CALLBACK_STAGE_6] Secondary ORM commit failed (%s: %s). Activating raw SQL upsert fallback.",
+                    type(second_commit_err).__name__, second_commit_err, exc_info=True
+                )
+                params = {
+                    "device_id": clean_device_id,
+                    "repairability_score": float(repairability),
+                    "circular_recovery_score": float(recovery_score),
+                    "repair_cost": float(repair_cost),
+                    "component_value": float(component_val),
+                    "recommendation": canonical_rec,
+                    "co2_avoided_kg": float(co2_avoided),
+                    "assessed_by": assessed_by,
+                    "notes": notes,
+                    "factors": factors_str,
+                    "assessed_at": assessed_at_val,
+                    "new_status": new_status,
+                }
+                if is_pg:
+                    db.session.execute(text(
+                        "UPDATE collection.devices SET status = :new_status WHERE id = :device_id"
+                    ), {"new_status": new_status, "device_id": clean_device_id})
+                    try:
+                        db.session.execute(text(
+                            "INSERT INTO collection.assessment_results "
+                            "(device_id, repairability_score, circular_recovery_score, repair_cost, component_value, recommendation, co2_avoided_kg, assessed_by, notes, factors, assessed_at) "
+                            "VALUES (:device_id, :repairability_score, :circular_recovery_score, :repair_cost, :component_value, :recommendation, :co2_avoided_kg, :assessed_by, :notes, :factors, :assessed_at) "
+                            "ON CONFLICT (device_id) DO UPDATE SET "
+                            "repairability_score = EXCLUDED.repairability_score, "
+                            "circular_recovery_score = EXCLUDED.circular_recovery_score, "
+                            "repair_cost = EXCLUDED.repair_cost, "
+                            "component_value = EXCLUDED.component_value, "
+                            "recommendation = EXCLUDED.recommendation, "
+                            "co2_avoided_kg = EXCLUDED.co2_avoided_kg, "
+                            "assessed_by = EXCLUDED.assessed_by, "
+                            "notes = EXCLUDED.notes, "
+                            "factors = EXCLUDED.factors, "
+                            "assessed_at = EXCLUDED.assessed_at"
+                        ), params)
+                        db.session.commit()
+                    except Exception as pg_sql_err:
+                        db.session.rollback()
+                        current_app.logger.warning(
+                            "[ASSESSMENT_CALLBACK_STAGE_6] Raw SQL upsert with float failed: %s. Using integer cast in raw SQL.",
+                            pg_sql_err
+                        )
+                        db.session.execute(text(
+                            "UPDATE collection.devices SET status = :new_status WHERE id = :device_id"
+                        ), {"new_status": new_status, "device_id": clean_device_id})
+                        db.session.execute(text(
+                            "INSERT INTO collection.assessment_results "
+                            "(device_id, repairability_score, circular_recovery_score, repair_cost, component_value, recommendation, co2_avoided_kg, assessed_by, notes, factors, assessed_at) "
+                            "VALUES (:device_id, CAST(:repairability_score AS INTEGER), CAST(:circular_recovery_score AS INTEGER), :repair_cost, :component_value, :recommendation, :co2_avoided_kg, :assessed_by, :notes, :factors, :assessed_at) "
+                            "ON CONFLICT (device_id) DO UPDATE SET "
+                            "repairability_score = CAST(EXCLUDED.repairability_score AS INTEGER), "
+                            "circular_recovery_score = CAST(EXCLUDED.circular_recovery_score AS INTEGER), "
+                            "repair_cost = EXCLUDED.repair_cost, "
+                            "component_value = EXCLUDED.component_value, "
+                            "recommendation = EXCLUDED.recommendation, "
+                            "co2_avoided_kg = EXCLUDED.co2_avoided_kg, "
+                            "assessed_by = EXCLUDED.assessed_by, "
+                            "notes = EXCLUDED.notes, "
+                            "factors = EXCLUDED.factors, "
+                            "assessed_at = EXCLUDED.assessed_at"
+                        ), params)
+                        db.session.commit()
+                else:
+                    db.session.execute(text(
+                        "UPDATE devices SET status = :new_status WHERE id = :device_id"
+                    ), {"new_status": new_status, "device_id": clean_device_id})
+                    db.session.execute(text(
+                        "INSERT INTO assessment_results "
+                        "(device_id, repairability_score, circular_recovery_score, repair_cost, component_value, recommendation, co2_avoided_kg, assessed_by, notes, factors, assessed_at) "
+                        "VALUES (:device_id, :repairability_score, :circular_recovery_score, :repair_cost, :component_value, :recommendation, :co2_avoided_kg, :assessed_by, :notes, :factors, :assessed_at) "
+                        "ON CONFLICT(device_id) DO UPDATE SET "
+                        "repairability_score = excluded.repairability_score, "
+                        "circular_recovery_score = excluded.circular_recovery_score, "
+                        "repair_cost = excluded.repair_cost, "
+                        "component_value = excluded.component_value, "
+                        "recommendation = excluded.recommendation, "
+                        "co2_avoided_kg = excluded.co2_avoided_kg, "
+                        "assessed_by = excluded.assessed_by, "
+                        "notes = excluded.notes, "
+                        "factors = excluded.factors, "
+                        "assessed_at = excluded.assessed_at"
+                    ), params)
+                    db.session.commit()
+
+                current_app.logger.info(
+                    "[ASSESSMENT_CALLBACK_STAGE_6] Raw SQL upsert commit succeeded | device_id=%s, transfer_id=%s",
+                    clean_device_id, transfer_id
+                )
 
     except Exception as e:
         db.session.rollback()

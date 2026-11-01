@@ -273,8 +273,11 @@ def create_app(database=None, config_class=None):
                             db.session.execute(text(
                                 "DO $$ BEGIN "
                                 "IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'collection' AND table_name = 'assessment_results') THEN "
-                                "  BEGIN ALTER TABLE collection.assessment_results ALTER COLUMN repairability_score TYPE DOUBLE PRECISION; EXCEPTION WHEN OTHERS THEN NULL; END; "
-                                "  BEGIN ALTER TABLE collection.assessment_results ALTER COLUMN circular_recovery_score TYPE DOUBLE PRECISION; EXCEPTION WHEN OTHERS THEN NULL; END; "
+                                "  BEGIN ALTER TABLE collection.assessment_results ALTER COLUMN repairability_score TYPE DOUBLE PRECISION USING repairability_score::double precision; EXCEPTION WHEN OTHERS THEN NULL; END; "
+                                "  BEGIN ALTER TABLE collection.assessment_results ALTER COLUMN circular_recovery_score TYPE DOUBLE PRECISION USING circular_recovery_score::double precision; EXCEPTION WHEN OTHERS THEN NULL; END; "
+                                "END IF; "
+                                "IF EXISTS (SELECT 1 FROM information_schema.sequences WHERE sequence_schema = 'collection' AND sequence_name = 'assessment_results_id_seq') THEN "
+                                "  BEGIN PERFORM setval('collection.assessment_results_id_seq', COALESCE((SELECT MAX(id) FROM collection.assessment_results), 1)); EXCEPTION WHEN OTHERS THEN NULL; END; "
                                 "END IF; "
                                 "END $$;"
                             ))
