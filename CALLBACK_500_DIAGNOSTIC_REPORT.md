@@ -177,3 +177,4 @@ Upon callback receipt:
    - Calling `/reports/assessment/EW-2026-D86F5C8F.pdf` executes [`generate_assessment_pdf()`](file:///D:/E-waste-Recovery/backend/reports.py) and outputs the verified technical report with repair cost, component value, and parts recovery decision.
 4. **Recovery Tracking:**
    - Visible on the main dashboard, devices table (under the Parts Recovery badge), and notifications bell.
+

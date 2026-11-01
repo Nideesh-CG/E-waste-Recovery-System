@@ -1542,6 +1542,8 @@ def create_app(database=None, config_class=None):
                             except Exception:
                                 resp_json = None
 
+                    is_json = not is_html and resp_json is not None
+
                     if resp.status_code in (200, 201):
                         if is_html or not isinstance(resp_json, dict):
                             transfer.status = "Failed"
