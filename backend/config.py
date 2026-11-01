@@ -140,6 +140,7 @@ class Config:
     # Inbound API authentication key (used by partners calling our endpoints)
     CIRCULAR_API_KEY = (
         os.environ.get("CIRCULAR_API_KEY")
+        or os.environ.get("COLLECTION_API_KEY")
         or ("dev-circular-key" if not IS_PRODUCTION else "")
     )
 

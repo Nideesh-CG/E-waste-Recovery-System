@@ -41,11 +41,12 @@ def verify_api_key() -> bool:
     
     Strictly checks headers only; credentials from query parameters are prohibited.
     """
-    expected_key = current_app.config.get("CIRCULAR_API_KEY")
+    expected_key = current_app.config.get("CIRCULAR_API_KEY") or current_app.config.get("COLLECTION_API_KEY")
     is_prod = current_app.config.get("IS_PRODUCTION", False)
 
     # In production or development, missing expected_key must fail
     if not expected_key:
+        current_app.logger.warning("Inbound API verification failed: CIRCULAR_API_KEY / COLLECTION_API_KEY not configured")
         return False
 
     auth_header = request.headers.get("Authorization", "")
@@ -175,6 +176,7 @@ def dispatch_device_to_partner(device: Device, transfer_id: Optional[str] = None
     now = datetime.now(timezone.utc)
     file_name = f"{device.id}.json"
 
+    failure_stage = "pre_dispatch"
     if partner_url:
         target_endpoint = f"{partner_url}/api/v1/refurbishment/devices"
         if not partner_key:
@@ -183,6 +185,10 @@ def dispatch_device_to_partner(device: Device, transfer_id: Optional[str] = None
             transfer_status = "Failed"
             success = False
             message = "Partner transfer failed: PARTNER_API_KEY is not configured."
+            current_app.logger.warning(
+                "Partner transfer aborted: PARTNER_API_KEY missing | transfer_id=%s, device_id=%s, endpoint=%s",
+                transfer_id, device.id, target_endpoint,
+            )
         else:
             headers = {
                 "Content-Type": "application/json",
@@ -190,7 +196,12 @@ def dispatch_device_to_partner(device: Device, transfer_id: Optional[str] = None
                 "Authorization": f"Bearer {partner_key}",
                 "Idempotency-Key": transfer_id,
             }
+            failure_stage = "partner_dispatch"
             try:
+                current_app.logger.info(
+                    "Dispatching device to partner | transfer_id=%s, device_id=%s, endpoint=%s, stage=%s",
+                    transfer_id, device.id, target_endpoint, failure_stage,
+                )
                 resp = requests.post(
                     target_endpoint, json=payload, headers=headers, timeout=10
                 )
@@ -202,31 +213,64 @@ def dispatch_device_to_partner(device: Device, transfer_id: Optional[str] = None
                     device.transition_to("Processing")
                     success = True
                     message = "Transfer successfully dispatched to partner application."
+                    current_app.logger.info(
+                        "Partner transfer succeeded | transfer_id=%s, device_id=%s, status=%s",
+                        transfer_id, device.id, http_status,
+                    )
                 elif resp.status_code == 202:
                     transfer_status = "Processing"
                     device.transition_to("Processing")
                     success = True
                     message = "Transfer accepted by partner. Assessment in progress."
+                    current_app.logger.info(
+                        "Partner transfer accepted | transfer_id=%s, device_id=%s, status=%s",
+                        transfer_id, device.id, http_status,
+                    )
                 elif resp.status_code == 409:
                     transfer_status = "Failed"
                     success = False
                     message = "Partner reported duplicate transfer conflict (409)."
+                    current_app.logger.warning(
+                        "Partner transfer duplicate conflict | transfer_id=%s, device_id=%s, status=%s",
+                        transfer_id, device.id, http_status,
+                    )
                 else:
                     transfer_status = "Failed"
                     success = False
-                    message = f"Partner transfer failed with status {resp.status_code}."
+                    err_msg = ""
+                    try:
+                        err_json = resp.json()
+                        err_msg = err_json.get("message") or err_json.get("error")
+                    except Exception:
+                        pass
+                    if err_msg:
+                        message = f"Partner transfer failed with status {resp.status_code}: {err_msg}"
+                    else:
+                        message = f"Partner transfer failed with status {resp.status_code}."
+                    current_app.logger.warning(
+                        "Partner transfer failed | transfer_id=%s, device_id=%s, endpoint=%s, status=%s, stage=%s, response=%s",
+                        transfer_id, device.id, target_endpoint, http_status, failure_stage, response_body[:200],
+                    )
             except requests.Timeout as e:
                 http_status = "504 Gateway Timeout"
                 response_body = f"Network timeout contacting partner: {str(e)}"
                 transfer_status = "Failed"
                 success = False
                 message = "Network timeout contacting partner. Transfer recorded as Failed."
+                current_app.logger.error(
+                    "Partner transfer timeout | transfer_id=%s, device_id=%s, endpoint=%s, stage=%s, exception=%s",
+                    transfer_id, device.id, target_endpoint, failure_stage, type(e).__name__,
+                )
             except requests.RequestException as e:
                 http_status = "503 Service Unavailable"
                 response_body = f"Connection error: {str(e)}"
                 transfer_status = "Failed"
                 success = False
                 message = "Network error contacting partner. Transfer recorded as Failed."
+                current_app.logger.error(
+                    "Partner transfer network error | transfer_id=%s, device_id=%s, endpoint=%s, stage=%s, exception=%s",
+                    transfer_id, device.id, target_endpoint, failure_stage, type(e).__name__,
+                )
     else:
         target_endpoint = "POST /api/v1/refurbishment/devices"
         http_status = "Not sent — awaiting dispatch"
@@ -357,7 +401,10 @@ def receive_assessment():
         if "repairability_score" in data and data["repairability_score"] is not None:
             if isinstance(data["repairability_score"], bool):
                 return jsonify({"error": "Validation Error", "message": "repairability_score must be an integer between 0 and 100"}), 400
-            r_val = float(data["repairability_score"])
+            try:
+                r_val = float(data["repairability_score"])
+            except (ValueError, TypeError):
+                return jsonify({"error": "Validation Error", "message": "repairability_score must be an integer between 0 and 100"}), 400
             if not math.isfinite(r_val) or r_val != int(r_val) or not (0 <= r_val <= 100):
                 return jsonify({"error": "Validation Error", "message": "repairability_score must be an integer between 0 and 100"}), 400
             repairability = int(r_val)
@@ -367,7 +414,10 @@ def receive_assessment():
         if "circular_recovery_score" in data and data["circular_recovery_score"] is not None:
             if isinstance(data["circular_recovery_score"], bool):
                 return jsonify({"error": "Validation Error", "message": "circular_recovery_score must be an integer between 0 and 100"}), 400
-            c_val = float(data["circular_recovery_score"])
+            try:
+                c_val = float(data["circular_recovery_score"])
+            except (ValueError, TypeError):
+                return jsonify({"error": "Validation Error", "message": "circular_recovery_score must be an integer between 0 and 100"}), 400
             if not math.isfinite(c_val) or c_val != int(c_val) or not (0 <= c_val <= 100):
                 return jsonify({"error": "Validation Error", "message": "circular_recovery_score must be an integer between 0 and 100"}), 400
             recovery_score = int(c_val)
@@ -473,6 +523,7 @@ def receive_assessment():
         }), 409
 
     # Transactional execution
+    failure_stage = "assessment_persistence"
     try:
         # Save or update AssessmentResult
         assessment = AssessmentResult.query.filter_by(device_id=device_id).first()
@@ -517,11 +568,23 @@ def receive_assessment():
         )
         db.session.add(inbound_transfer)
         db.session.commit()
+        current_app.logger.info(
+            "Assessment result successfully persisted | device_id=%s, transfer_id=%s, new_status=%s",
+            device.id, transfer_id, device.status,
+        )
 
     except Exception as e:
         db.session.rollback()
-        current_app.logger.error("Transaction failed during assessment processing: %s", e)
-        return jsonify({"error": "Internal Error", "message": "Failed to process assessment result."}), 500
+        current_app.logger.error(
+            "Transaction failed during assessment processing | device_id=%s, idempotency_key=%s, stage=%s, exception_type=%s, error=%s",
+            device_id,
+            idempotency_key,
+            failure_stage,
+            type(e).__name__,
+            str(e),
+            exc_info=True,
+        )
+        return jsonify({"error": "Internal Error", "message": f"Failed to process assessment result: {type(e).__name__}"}), 500
 
     return jsonify({
         "status": "success",
