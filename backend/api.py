@@ -7,9 +7,10 @@ import json
 import math
 import secrets
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional, Tuple
 import requests
-from flask import Blueprint, current_app, jsonify, request, send_file, session
+from flask import Blueprint, current_app, has_request_context, jsonify, request, send_file, session
 from models import AssessmentResult, Device, DeviceFile, Transfer, db
 from storage import get_storage_service
 
@@ -96,24 +97,25 @@ def authenticate():
     """Global authentication guard for API endpoints."""
     # Health check and notifications are public
     clean_path = request.path.rstrip("/")
-    if clean_path in ("/api/health", "/api/v1/health", "/api/v1/notifications"):
+    if clean_path in ("/api/health", "/api/v1/health", "/api/notifications", "/api/v1/notifications"):
         return None
 
     # Immediate rejection of path traversal on files endpoint
-    if request.path.startswith("/api/v1/files/"):
-        from urllib.parse import unquote
-        subpath = request.path[len("/api/v1/files/"):]
-        decoded_subpath = unquote(subpath)
-        if (
-            ".." in subpath
-            or ".." in decoded_subpath
-            or "\\" in subpath
-            or "\\" in decoded_subpath
-        ):
-            return jsonify({"error": "Bad Request", "message": "Invalid file key"}), 400
+    for prefix in ("/api/v1/files/", "/api/files/"):
+        if request.path.startswith(prefix):
+            from urllib.parse import unquote
+            subpath = request.path[len(prefix):]
+            decoded_subpath = unquote(subpath)
+            if (
+                ".." in subpath
+                or ".." in decoded_subpath
+                or "\\" in subpath
+                or "\\" in decoded_subpath
+            ):
+                return jsonify({"error": "Bad Request", "message": "Invalid file key"}), 400
 
     # Allow browser session authenticated requests to view uploaded files
-    if request.path.startswith("/api/v1/files/") and (
+    if (request.path.startswith("/api/v1/files/") or request.path.startswith("/api/files/")) and (
         session.get("authenticated") or session.get("logged_in")
     ):
         return None
@@ -125,8 +127,8 @@ def authenticate():
         }), 401
 
 
-@api_bp.get("/health")
-@api_bp.get("/v1/health")
+@api_bp.get("/health", strict_slashes=False)
+@api_bp.get("/v1/health", strict_slashes=False)
 def health_check():
     """Service health and database connectivity probe (Public)."""
     try:
@@ -146,7 +148,8 @@ def health_check():
     }), 200 if is_healthy else 503
 
 
-@api_bp.get("/v1/devices")
+@api_bp.get("/devices", strict_slashes=False)
+@api_bp.get("/v1/devices", strict_slashes=False)
 def list_devices():
     """List all registered devices with optional status and query filtering."""
     query = Device.query
@@ -173,7 +176,8 @@ def list_devices():
     }), 200
 
 
-@api_bp.get("/v1/devices/<device_id>")
+@api_bp.get("/devices/<device_id>", strict_slashes=False)
+@api_bp.get("/v1/devices/<device_id>", strict_slashes=False)
 def get_device(device_id):
     """Retrieve details for a single device, including assessment and transfers."""
     device = Device.query.filter_by(id=device_id).first()
@@ -197,7 +201,7 @@ def dispatch_device_to_partner(device: Device, transfer_id: Optional[str] = None
         transfer_id = f"TRF-{secrets.token_hex(4).upper()}"
 
     storage = get_storage_service(current_app.config)
-    base_url = current_app.config.get("BACKEND_URL") or (request.host_url if request else "")
+    base_url = current_app.config.get("BACKEND_URL") or (request.host_url if has_request_context() else "")
     payload = device.to_partner_payload(transfer_id, storage_service=storage, base_url=base_url)
     partner_url = (current_app.config.get("PARTNER_API_URL") or "").rstrip("/")
     partner_key = current_app.config.get("PARTNER_API_KEY") or ""
@@ -373,6 +377,8 @@ def dispatch_device_to_partner(device: Device, transfer_id: Optional[str] = None
     ).first()
     if existing_transfer:
         transfer = existing_transfer
+        transfer.device_id = device.id
+        transfer.file = file_name
         transfer.status = transfer_status
         transfer.time = f"Today, {now.strftime('%I:%M %p')}"
         transfer.timestamp = now
@@ -380,6 +386,7 @@ def dispatch_device_to_partner(device: Device, transfer_id: Optional[str] = None
         transfer.response_body = response_body
         transfer.endpoint = target_endpoint
         transfer.payload = json.dumps(payload)
+        transfer.idempotency_key = transfer_id
     else:
         transfer = Transfer(
             id=transfer_id,
@@ -406,10 +413,15 @@ def dispatch_device_to_partner(device: Device, transfer_id: Optional[str] = None
             "Failed to commit transfer dispatch record | transfer_id=%s, error=%s",
             transfer_id, exc, exc_info=True
         )
+        success = False
+        message = f"Failed to persist transfer dispatch record: {type(exc).__name__}"
+        if transfer:
+            transfer.status = "Failed"
     return transfer, success, message
 
 
-@api_bp.post("/v1/devices/<device_id>/send")
+@api_bp.post("/devices/<device_id>/send", strict_slashes=False)
+@api_bp.post("/v1/devices/<device_id>/send", strict_slashes=False)
 def api_send_device(device_id):
     """Dispatch device to partner Refurbishment Intelligence service via REST API."""
     device = Device.query.filter_by(id=device_id).first()
@@ -439,7 +451,8 @@ def api_send_device(device_id):
     }), http_code
 
 
-@api_bp.get("/v1/transfers")
+@api_bp.get("/transfers", strict_slashes=False)
+@api_bp.get("/v1/transfers", strict_slashes=False)
 def list_transfers():
     """List all transfers with optional status filter."""
     query = Transfer.query
@@ -453,7 +466,8 @@ def list_transfers():
     }), 200
 
 
-@api_bp.get("/v1/transfers/<transfer_id>")
+@api_bp.get("/transfers/<transfer_id>", strict_slashes=False)
+@api_bp.get("/v1/transfers/<transfer_id>", strict_slashes=False)
 def get_transfer(transfer_id):
     """Retrieve details for a specific transfer."""
     transfer = Transfer.query.filter_by(id=transfer_id).first()
@@ -500,8 +514,10 @@ def extract_numeric(val, field_name: str, min_val: float = None, max_val: float 
     return num
 
 
-@api_bp.post("/v1/assessment-results")
-@api_bp.post("/v1/collection/assessments")
+@api_bp.post("/v1/assessment-results", strict_slashes=False)
+@api_bp.post("/v1/collection/assessments", strict_slashes=False)
+@api_bp.post("/assessment-results", strict_slashes=False)
+@api_bp.post("/collection/assessments", strict_slashes=False)
 def receive_assessment():
     """Inbound webhook / API endpoint for partners to post assessment results.
     
@@ -603,8 +619,10 @@ def receive_assessment():
 
         c_raw = data.get("circular_recovery_score") if "circular_recovery_score" in data else data.get("circular_score")
         recovery_score = extract_numeric(c_raw, "circular_recovery_score", min_val=0.0, max_val=100.0)
-        if recovery_score is None:
+        if recovery_score is None and repairability is not None:
             recovery_score = repairability  # Default fallback if partner payload does not supply separate recovery score
+        if repairability is None and recovery_score is not None:
+            repairability = recovery_score
 
         rc_raw = data.get("repair_cost") if "repair_cost" in data else data.get("estimated_repair_cost")
         repair_cost = extract_numeric(rc_raw, "repair_cost", min_val=0.0)
@@ -899,7 +917,8 @@ def receive_assessment():
     }), 200
 
 
-@api_bp.get("/v1/notifications")
+@api_bp.get("/notifications", strict_slashes=False)
+@api_bp.get("/v1/notifications", strict_slashes=False)
 def get_notifications():
     """Retrieve recent notifications derived from real database records."""
     items = []
@@ -931,7 +950,8 @@ def get_notifications():
     }), 200
 
 
-@api_bp.get("/v1/files/<path:storage_key>")
+@api_bp.get("/files/<path:storage_key>", strict_slashes=False)
+@api_bp.get("/v1/files/<path:storage_key>", strict_slashes=False)
 def get_private_file(storage_key):
     """Retrieve private document or invoice with authentication."""
     # Ensure safe storage key and reject path traversal
@@ -967,16 +987,19 @@ def get_private_file(storage_key):
 
     try:
         file_bytes, content_type = storage.retrieve(d_file.storage_key)
+        safe_filename = (d_file.original_filename or Path(storage_key).name or "document.bin").replace('"', '')
         resp = send_file(
             io.BytesIO(file_bytes),
             mimetype=content_type or d_file.content_type or "application/octet-stream",
             as_attachment=False,
-            download_name=d_file.original_filename or Path(storage_key).name
+            download_name=safe_filename
         )
-        resp.headers["Content-Disposition"] = f'inline; filename="{d_file.original_filename or Path(storage_key).name}"'
+        resp.headers["Content-Disposition"] = f'inline; filename="{safe_filename}"'
         return resp
     except FileNotFoundError:
         return jsonify({"error": "Not Found", "message": "File not found"}), 404
+    except PermissionError as e:
+        return jsonify({"error": "Forbidden", "message": str(e)}), 403
     except Exception as e:
         current_app.logger.error("Error retrieving file %s: %s", storage_key, e)
         return jsonify({"error": "Storage Error", "message": "Failed to retrieve requested file"}), 500
